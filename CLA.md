@@ -82,13 +82,13 @@ Signed-off-by: Your Name <your.email@example.com>
 CLA-Agreed: RECURSUM-ICLA
 ```
 
-Alternatively, you may sign the CLA explicitly by emailing legal@neurotechnet.co with your full name, email, and GitHub username.
+Alternatively, you may sign the CLA explicitly by emailing ruben.guerrero@neurotechnet.co with your full name, email, and GitHub username.
 
 ---
 
 ## Corporate Contributor License Agreement (CCLA)
 
-Organizations whose employees contribute to RECURSUM must sign a Corporate CLA. Contact legal@neurotechnet.co to request the CCLA form.
+Organizations whose employees contribute to RECURSUM must sign a Corporate CLA. Contact ruben.guerrero@neurotechnet.co to request the CCLA form.
 
 The CCLA grants the same licenses as the ICLA on behalf of all authorized contributors from the organization.
 

@@ -108,8 +108,8 @@ Details will be published when/if this program is activated.
 
 ## 8. Contact
 
-- **Permission requests:** legal@neurotechnet.co
-- **Report misuse:** legal@neurotechnet.co
+- **Permission requests:** ruben.guerrer@neurotechnet.co
+- **Report misuse:** ruben.guerrero@neurotechnet.co
 
 ---
 
