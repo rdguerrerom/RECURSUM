@@ -1240,15 +1240,49 @@ jupyter notebook notebooks/generated/
 ---
 ## License
 
-- **RECURSUM code:** [Mozilla Public License 2.0 (MPL-2.0)](https://www.mozilla.org/en-US/MPL/2.0/)
+**RECURSUM** is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL 2.0).
+
+### What this means
+
+| You can... | You must... | You cannot... |
+|------------|-------------|---------------|
+| ✅ Use commercially | 📋 Disclose source of modified MPL files | ❌ Use NeuroTechNet trademarks |
+| ✅ Modify the code | 📋 Include license/copyright notices | ❌ Hold contributors liable |
+| ✅ Distribute | 📋 License modifications to MPL files under MPL | |
+| ✅ Use privately | | |
+| ✅ Add proprietary code in separate files | | |
+
+### Third-party licenses
+
 - **vectorclass library:** Apache 2.0 License (Agner Fog)
-- **pybind11:** BSD-3-Clause License
+- **pybind11:** BSD License
 
-See [LICENSE](LICENSE) for the full MPL 2.0 text. Trademarks ("RECURSUM", "NeuroTechNet") are governed by [TRADEMARKS.md](TRADEMARKS.md) and are not granted under the code license.
+### Trademarks
 
-### Contributing
+"RECURSUM" and "NeuroTechNet" are trademarks of NeuroTechNet S.A.S. The code license does not grant trademark rights. See [TRADEMARKS.md](TRADEMARKS.md).
 
-External contributions require signing our [Contributor License Agreement](CLA.md) to preserve NeuroTechNet's ability to offer dual licensing (open-source + commercial).
+### Commercial licensing
+
+For organizations requiring a commercial license (modifications without MPL disclosure requirements), contact: licensing@neurotechnet.co
+
+---
+
+## Contributing
+
+Contributions welcome! By contributing, you agree to the [Contributor License Agreement](CLA.md).
+
+### Sign-off your commits
+
+```bash
+git commit -s -m "Your commit message"
+# Adds: Signed-off-by: Your Name <email>
+```
+
+### Areas of interest
+
+- Additional recurrence families (Jacobi, Gegenbauer, etc.)
+- Multi-dimensional recurrences
+- Symbolic verification against computer algebra systems
 
 ---
 
