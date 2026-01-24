@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=65", "wheel", "pybind11>=2.10", "cmake>=3.18", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recursum"
+version = "0.1.0"
+description = "RECURSUM_Research: Zero-overhead recurrence relation library with Python DSL and C++ codegen"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Ruben", email = "ruben@example.com"}
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist",
+    "scipy>=1.7",
+    "jupyter",
+    "matplotlib",
+    "seaborn",
+    "watchdog",
+    "black",
+    "mypy",
+    "pybind11>=2.10",
+]
+notebooks = [
+    "jupyter",
+    "matplotlib",
+    "seaborn",
+    "pandas",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-xdist",
+    "scipy>=1.7",
+    "numpy>=1.20",
+]
+
+[project.scripts]
+recursum = "recursum.cli:main"
+
+[tool.setuptools]
+packages = ["recursum", "recursum.codegen", "recursum.recurrences"]
+
+[tool.setuptools.package-data]
+recursum = ["*.so", "*.pyd", "_*.so", "_*.pyd"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

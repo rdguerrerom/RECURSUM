@@ -1,0 +1,19 @@
+2026-01-15T21:21:07-05:00
+Running ./bin/bench_jk_alkanes
+Run on (28 X 5300 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x14)
+  L1 Instruction 32 KiB (x14)
+  L2 Unified 2048 KiB (x14)
+  L3 Unified 33792 KiB (x1)
+Load Average: 0.75, 0.51, 0.37
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+name,iterations,real_time,cpu_time,time_unit,bytes_per_second,items_per_second,label,error_occurred,error_message,"n_atoms","n_carbons","n_shells"
+"BM_J_Matrix_CH4/min_time:2.000",6073,460.954,460.813,us,,,,,,5,1,11
+"BM_J_Matrix_C2H6/min_time:2.000",823,3401.02,3400.39,us,,,,,,8,2,18
+"BM_J_Matrix_C3H8/min_time:2.000",221,12682.6,12679.2,us,,,,,,11,3,25
+"BM_J_Matrix_C4H10/min_time:2.000",82,34189.1,34184.2,us,,,,,,14,4,32
+"BM_K_Matrix_CH4/min_time:2.000",14357,195.115,195.066,us,,,,,,5,1,11
+"BM_K_Matrix_C2H6/min_time:2.000",1754,1596.52,1596.21,us,,,,,,8,2,18
+"BM_K_Matrix_C3H8/min_time:2.000",450,6224.13,6223.27,us,,,,,,11,3,25
+"BM_K_Matrix_C4H10/min_time:2.000",160,17446.4,17444.2,us,,,,,,14,4,32
