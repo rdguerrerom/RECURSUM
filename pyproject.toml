@@ -7,7 +7,7 @@ name = "recursum"
 version = "0.1.0"
 description = "RECURSUM_Research: Zero-overhead recurrence relation library with Python DSL and C++ codegen"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "MPL-2.0"}
 authors = [
     {name = "Ruben", email = "ruben@example.com"}
 ]
