@@ -88,6 +88,12 @@ All tests passing with validated accuracy:
 
 ### DLMF Coverage Analysis
 
+```
+DLMF]
+
+NIST Digital Library of Mathematical Functions. https://dlmf.nist.gov/, Release 1.2.5 of 2025-12-15. F. W. J. Olver, A. B. Olde Daalhuis, D. W. Lozier, B. I. Schneider, R. F. Boisvert, C. W. Clark, B. R. Miller, B. V. Saunders, H. S. Cohl, and M. A. McClain, eds. 
+```
+
 RECURSUM achieves **100% coverage** of DLMF recurrence families addressable with three-term recurrences:
 
 #### Chapter 18: Orthogonal Polynomials
