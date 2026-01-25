@@ -289,11 +289,11 @@ Total: ~3-4 minutes per recurrence
 
 ### Key Benefits
 
-✅ **No C++ knowledge required** - Define recurrences in pure Python
-✅ **Instant feedback** - Test immediately after rebuild
-✅ **SciPy-level accuracy** - Machine precision (~10⁻¹⁵ error)
-✅ **Production-ready** - SIMD-optimized, handles arrays efficiently
-✅ **Reproducible** - All code generated from definitions
+- ✅ **No C++ knowledge required** - Define recurrences in pure Python
+- ✅ **Instant feedback** - Test immediately after rebuild
+- ✅ **SciPy-level accuracy** - Machine precision (~10⁻¹⁵ error)
+- ✅ **Production-ready** - SIMD-optimized, handles arrays efficiently
+- ✅ **Reproducible** - All code generated from definitions
 
 ### Common Patterns
 
