@@ -1269,7 +1269,7 @@ jupyter notebook notebooks/generated/
 
 ### Commercial licensing
 
-For organizations requiring a commercial license (modifications without MPL disclosure requirements), contact: licensing@neurotechnet.co
+For organizations requiring a commercial license (modifications without MPL disclosure requirements), contact:ruben.guerrero@neurotechnet.co
 
 ---
 
