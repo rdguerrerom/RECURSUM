@@ -89,7 +89,7 @@ All tests passing with validated accuracy:
 ### DLMF Coverage Analysis
 
 ```
-DLMF]
+[DLMF]
 
 NIST Digital Library of Mathematical Functions. https://dlmf.nist.gov/, Release 1.2.5 of 2025-12-15. F. W. J. Olver, A. B. Olde Daalhuis, D. W. Lozier, B. I. Schneider, R. F. Boisvert, C. W. Clark, B. R. Miller, B. V. Saunders, H. S. Cohl, and M. A. McClain, eds. 
 ```
