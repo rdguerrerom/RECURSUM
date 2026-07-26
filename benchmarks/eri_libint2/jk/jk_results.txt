@@ -1,0 +1,8 @@
+# Contracted J/K: RECURSUM (DAG Obara-Saika kernels) vs libint2
+# same contraction (primitive loop), same Chebyshev Boys, same BLAS (DGEMM/DGEMV) digestion
+# 6-31G alkanes, unscreened (O(N^4)), scalar double, pinned P-core; validated to 2e-12 vs PySCF get_jk
+alkane   shells  RECUR_J  libint_J J_spdup  RECUR_K  libint_K K_spdup 
+CH4      13      29.8     61.8     2.07x    29.0     60.4     2.08x   
+C2H6     22      277.1    533.0    1.92x    271.3    499.4    1.84x   
+C3H8     31      759.2    1552.0   2.04x    778.7    1586.1   2.04x   
+C4H10    40      2162.7   4406.2   2.04x    2139.0   4347.7   2.03x   
