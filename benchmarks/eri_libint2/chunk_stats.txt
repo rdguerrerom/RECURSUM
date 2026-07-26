@@ -1,0 +1,2 @@
+ffff chunked: 77756 nodes -> 65 chunks, frontier fr[19584] (153 KB)
+compile: ~90s (chunked) vs ~600s (monolithic); runtime: chunked 0.93x monolithic (faster)

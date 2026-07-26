@@ -1,0 +1,17 @@
+ class  peakON  peakNv   frameON   frameNv frame_reduce
+  ssss       0       0         0         0            -
+  ssps       0       0         0         0            -
+  psps       6       6         0         0            -
+  sspp       7      12         0         0            -
+  pspp      25      48       232       232           0%
+  pppp     106     222       728       728           0%
+  ssds       6       6         0         0            -
+  dsds      61      75       424       424           0%
+  ssdd      57     108       280       280           0%
+  dddd    2159    6318      4096      4096           0%
+  ssfs      19      21        40        40           0%
+  fsfs     255     379      2920      2920           0%
+  ssff     192     454      1432      1432           0%
+  ffff   18693   67743      4096         0            -
+
+frame = bytes subtracted from %rsp in the kernel prologue (stack working set). ON = peak-liveness slot reuse; Nv = naive (one slot per intermediate). ffff has no naive variant (ON-only).

@@ -1,0 +1,24 @@
+# perf: pinned core 8, NQ=1000 quartets x REPS=1000, events=cycles,instructions,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses
+class    impl                    cycles   instructions    IPC         L1dloads    L1miss%       LLCloads   LLCmiss%
+pppp     recursum             375649497     1128537397   3.00        520498958   0.04%          33736    68.96%
+pppp     recursum_naive       373083159     1124901600   3.02        519630401   0.05%          31583    71.55%
+pppp     libint2              597337697     1377259569   2.31        676443969   0.58%        1540384     2.73%
+
+dddd     recursum           14098758010    29071778926   2.06      14541067068   0.02%         228482    11.21%
+dddd     recursum_naive     14104162853    29071564178   2.06      14541125929   0.02%         227669    11.12%
+dddd     libint2            22000723613    50029100638   2.27      35984165952   0.13%       16822468    71.91%
+
+fsfs     recursum             789123878     2876802128   3.65       1542028562   0.05%          44963    49.81%
+fsfs     recursum_naive       789015436     2876190891   3.65       1541889772   0.05%          39788    52.85%
+fsfs     libint2              984243806     2732096969   2.78       1219591703   0.21%         781517     4.30%
+
+ssff     recursum             594289562     1925520266   3.24        792735064   0.19%          35013    59.30%
+ssff     recursum_naive       597271314     1925484639   3.22        792722449   0.54%          42355    67.82%
+ssff     libint2              646719818     1693822911   2.62        734513848   0.31%         901782     3.50%
+
+# perf: pinned core 8, NQ=300 quartets x REPS=500, events=cycles,instructions,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses
+class    impl                    cycles   instructions    IPC         L1dloads    L1miss%       LLCloads   LLCmiss%
+ffff     recursum           22504286646    42934862104   1.91      21784409361   8.00%        1213483     3.38%
+ffff     recursum_naive  (no naive variant — ON-only class)
+ffff     libint2            41402511130    83226780315   2.01      64386153736   1.36%        4205384    39.77%
+

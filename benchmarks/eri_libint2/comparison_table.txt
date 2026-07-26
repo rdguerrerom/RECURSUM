@@ -1,0 +1,19 @@
+ class  nout  nodes  peak   RECURSUM    libint2  speedup   ns/integral
+------------------------------------------------------------------------------
+  ssss     1      1     0      0.79n      2.01n    2.54x   R= 0.79 L= 2.01  [RECURSUM faster]
+  ssps     3      5     0      1.28n      2.35n    1.84x   R= 0.43 L= 0.78  [RECURSUM faster]
+  psps     9     18     6      3.33n      4.84n    1.45x   R= 0.37 L= 0.54  [RECURSUM faster]
+  sspp     9     24     7      4.43n      7.16n    1.62x   R= 0.49 L= 0.80  [RECURSUM faster]
+  pspp    27     79    25     14.06n     27.54n    1.96x   R= 0.52 L= 1.02  [RECURSUM faster]
+  pppp    81    308   106     65.20n     85.16n    1.31x   R= 0.80 L= 1.05  [RECURSUM faster]
+  ssds     6     15     6      2.71n      3.88n    1.43x   R= 0.45 L= 0.65  [RECURSUM faster]
+  dsds    36    116    61     29.49n     44.54n    1.51x   R= 0.82 L= 1.24  [RECURSUM faster]
+  ssdd    36    149    57     29.31n     34.09n    1.16x   R= 0.81 L= 0.95  [RECURSUM faster]
+  dddd  1296   7623  2159   2926.55n   3108.53n    1.06x   R= 2.26 L= 2.40  [RECURSUM faster]
+  ssfs    10     35    19      7.81n      7.46n    0.95x   R= 0.78 L= 0.75  [libint2  faster]
+  fsfs   100    486   255    157.42n    169.05n    1.07x   R= 1.57 L= 1.69  [RECURSUM faster]
+  ssff   100    561   192    120.06n    108.25n    0.90x   R= 1.20 L= 1.08  [libint2  faster]
+  ffff 10000  77756 18693  32098.16n  49320.71n    1.54x   R= 3.21 L= 4.93  [RECURSUM faster]
+------------------------------------------------------------------------------
+Times are ns per full Cartesian class (all nout integrals), mean of 20 reps.
+Both built g++ -O3 -march=native -ffast-math, scalar double, same quartet.

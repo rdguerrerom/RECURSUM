@@ -1,0 +1,19 @@
+# generated kernels (regenerate with: python3 recursum_dag_emit.py)
+k_*.cpp
+recursum_eri_kernels*.h
+eri_classes.h
+recursum_eri_decls.h
+recursum_eri_naive_dispatch.h
+kernel_tus.txt
+# build products
+*.o
+*.a
+bench_eri
+perf_driver
+validate_kernels
+librecursum_eri.a
+results_eri.json
+# libint2 build tree (build from source separately)
+libint_build/
+__pycache__/
+eri_dag/__pycache__/
