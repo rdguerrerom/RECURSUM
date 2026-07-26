@@ -1,0 +1,6 @@
+# DNA J/K, 6-31G cart, 8-fold sym, screening off, reps=2 (min-of-rep), taskset -c 8, 2026-07-26T16:16:05Z
+recursum  dna_nucleoside.txt nao=188  J=32555.629 ms  K=28985.255 ms   Jrelerr=7.4e-12 Krelerr=3.5e-12 OK
+libint2   dna_nucleoside.txt nao=188  J=67561.104 ms  K=63541.812 ms   Jrelerr=7.4e-12 Krelerr=3.5e-12 OK
+recursum  dna_2mer.txt   nao=376  J=555165.470 ms  K=507919.365 ms   Jrelerr=1.5e-11 Krelerr=6.3e-12 OK
+libint2   dna_2mer.txt   nao=376  J=1056366.552 ms  K=1008594.616 ms   Jrelerr=1.5e-11 Krelerr=6.3e-12 OK
+ALL DONE
