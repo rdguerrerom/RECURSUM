@@ -51,29 +51,29 @@ int main(int argc,char**argv){
     printf("  %-12s %10s %10s %9s\n","term","RECURSUM","libint2","speedup");
     for(int o=0;o<3;o++){
         vector<double> M((size_t)nao*nao), blk(256);
-        // RECURSUM
-        double t0=now();
-        for(int r=0;r<reps;r++){
+        // RECURSUM (minimum of reps = least-contended, as in the J/K table)
+        double tR=1e30;
+        for(int r=0;r<reps;r++){ double s=now();
             for(auto&SA:sh)for(auto&SB:sh){ if(SB.off>SA.off) continue;
                 block(SA,SB,ops[o],Z,Rc,blk.data());
                 for(int a=0;a<SA.ncart;a++)for(int b=0;b<SB.ncart;b++){
                     double v=blk[a*SB.ncart+b];
                     M[(size_t)(SA.off+a)*nao+(SB.off+b)]=v;
                     M[(size_t)(SB.off+b)*nao+(SA.off+a)]=v; } }
-        }
-        double tR=(now()-t0)/reps*1e3;
-        // libint2
+            tR=std::min(tR,now()-s); }
+        tR*=1e3;
+        // libint2 (minimum of reps)
         libint2::Engine eng(lops[o], maxnp, maxL, 0);
         if(o==2) eng.set_params(charges);
         const auto& buf = eng.results();
-        double chk=0, t1=now();
-        for(int r=0;r<reps;r++){
+        double chk=0, tL=1e30;
+        for(int r=0;r<reps;r++){ double s=now();
             for(size_t i=0;i<lsh.size();++i)for(size_t j=0;j<=i;++j){
                 eng.compute(lsh[i],lsh[j]);
                 if(buf[0]) chk+=buf[0][0];
             }
-        }
-        double tL=(now()-t1)/reps*1e3;
+            tL=std::min(tL,now()-s); }
+        tL*=1e3;
         printf("  %-12s %10.4f %10.4f %8.2fx\n",names[o],tR,tL,tL/tR);
         if(chk==12345.6) printf("");   // keep chk live
     }
