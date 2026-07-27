@@ -221,7 +221,43 @@ def generate_project(pairs=LADDER, outdir="."):
         f.write("\n\n".join(parts) + "\n")
     with open(os.path.join(outdir, "onee_decls.h"), "w") as f:
         f.write("\n".join(decls) + "\n")
+    with open(os.path.join(outdir, "onee_dispatch.h"), "w") as f:
+        f.write(emit_dispatch(pairs))
     return len(pairs)
+
+
+def emit_dispatch(pairs=LADDER) -> str:
+    """(la,lb) -> kernel function pointer, for the contracted driver. Only
+    canonical la>=lb classes exist; the driver swaps+transposes for la<lb."""
+    def cases(pref):
+        return "\n".join(f"    case {la*8+lb}: return {pref}_{_pair_name(la,lb)};"
+                         for la, lb in pairs)
+    return f"""#pragma once
+// AUTO-GENERATED (la,lb) kernel dispatch. DO NOT EDIT.
+#include "recursum_onee_scalars.h"
+#include "onee_decls.h"
+typedef void (*ovlp_fn)(const OneEScalars&, double, double*);
+typedef void (*nuc_fn)(const OneEScalars&, const double*, double*);
+typedef void (*kin_fn)(const OneEScalars&, double, double*);
+static inline ovlp_fn onee_ovlp_dispatch(int la, int lb) {{
+  switch (la*8+lb) {{
+{cases("recursum_ovlp")}
+    default: return nullptr;
+  }}
+}}
+static inline nuc_fn onee_nuc_dispatch(int la, int lb) {{
+  switch (la*8+lb) {{
+{cases("recursum_nuc")}
+    default: return nullptr;
+  }}
+}}
+static inline kin_fn onee_kin_dispatch(int la, int lb) {{
+  switch (la*8+lb) {{
+{cases("recursum_kin")}
+    default: return nullptr;
+  }}
+}}
+"""
 
 
 if __name__ == "__main__":

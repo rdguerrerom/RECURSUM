@@ -23,6 +23,7 @@ same horizontal transfer (HRR, A→B) as the ERI:
 | `recursum_onee_emit.py` | **The emitter.** Generates C++ `recursum_ovlp_<ab>`, `recursum_nuc_<ab>`, `recursum_kin_<ab>` kernels (ss…ff) with global-CSE topological emission + the same peak-liveness slot allocator as the ERI emitter. Writes `onee_kernels.cpp`, `onee_decls.h`, `recursum_onee_scalars.h`. |
 | `onee_oracle.py` | Builds full contracted-Cartesian S/T/V matrices **from the DAG** and validates them against PySCF `int1e_ovlp/kin/nuc_cart`. |
 | `onee_export_expected.py` + `onee_validate.cpp` | Numeric check of the **emitted C++ kernels** against the PySCF-validated DAG blocks, per class. |
+| `export_onee.py` + `onee_driver.cpp` | **Contracted C++ driver.** Builds the full S/T/V matrices from the emitted kernels using the *same primitive-loop contraction approach as the ERI/JK drivers* (loop primitive pairs, weight by contraction coeff × per-shell norm, accumulate; canonical la≥lb kernels with swap+transpose), and validates against a PySCF reference. |
 
 ## Validation
 
@@ -36,6 +37,12 @@ python3 recursum_onee_emit.py     # emit kernels (ss..ff) + print DAG sizes
 python3 onee_export_expected.py   # export PySCF-validated expected blocks
 g++ -O2 -std=c++17 onee_validate.cpp onee_kernels.cpp -o onee_validate && ./onee_validate
 #   emitted kernels reproduce the DAG bit-exactly (relerr 0) for S, T, V, ss..ff
+
+# full contracted matrices, same contraction as the ERI/JK drivers, vs PySCF:
+python3 export_onee.py "C 0 0 0; O 0 0 2.1" cc-pvtz mol_co.txt   # s,p,d,f
+g++ -O3 -march=native -std=c++17 onee_driver.cpp onee_kernels.cpp -o onee_driver
+./onee_driver mol_co.txt
+#   S rel err=2.5e-15   T rel err=5.0e-15   V rel err=6.9e-15   ALL PASS  (maxL=3)
 ```
 
 Kernels consume precomputed per-primitive-pair scalars (a `OneEScalars` struct:
