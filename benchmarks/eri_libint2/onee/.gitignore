@@ -1,0 +1,8 @@
+# generated kernels + build artifacts (regenerable from recursum_onee_emit.py)
+onee_kernels.cpp
+onee_decls.h
+recursum_onee_scalars.h
+onee_expected.h
+onee_validate
+*.o
+__pycache__/
