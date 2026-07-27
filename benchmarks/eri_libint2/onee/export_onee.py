@@ -5,8 +5,8 @@ import numpy as np
 from pyscf import gto
 
 
-def export(atom, basis, out):
-    mol = gto.M(atom=atom, basis=basis, unit="Bohr", cart=True, verbose=0)
+def export(atom, basis, out, unit="Bohr"):
+    mol = gto.M(atom=atom, basis=basis, unit=unit, cart=True, verbose=0)
     nao = mol.nao_nr()
     S = mol.intor("int1e_ovlp_cart")
     T = mol.intor("int1e_kin_cart")
@@ -38,4 +38,5 @@ def export(atom, basis, out):
 
 
 if __name__ == "__main__":
-    export(sys.argv[1], sys.argv[2], sys.argv[3])
+    unit = sys.argv[4] if len(sys.argv) > 4 else "Bohr"
+    export(sys.argv[1], sys.argv[2], sys.argv[3], unit)
