@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recursum"
-version = "0.1.0"
+version = "1.0.0"
 description = "RECURSUM_Research: Zero-overhead recurrence relation library with Python DSL and C++ codegen"
 readme = "README.md"
 license = {text = "MPL-2.0"}
