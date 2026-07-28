@@ -157,6 +157,40 @@ These instabilities can be addressed with Miller's backward recursion (planned f
 
 ---
 
+## Head-to-Head with libint2 (Molecular Integrals)
+
+Breadth across the DLMF is one axis; the other is **performance on the single most
+demanding recurrence in the domain** — the four-centre electron-repulsion integral
+(ERI). RECURSUM is stress-tested directly against **libint2**, itself an automatic
+integral-code generator refined over ~two decades and embedded in production packages
+(Psi4, MPQC). The complete benchmark harness, data, and report live in
+[`benchmarks/eri_libint2/`](benchmarks/eri_libint2/).
+
+The comparison is apples-to-apples: **identical** compiler and flags, both libraries
+consuming identical inputs, returning **numerically identical** integrals. Because
+both *generate* code for the same Head-Gordon–Pople / Obara–Saika recurrence, the
+result isolates code-generation quality rather than pitting the framework against a
+naive baseline.
+
+| Integral set | Result vs libint2 | Notes |
+|---|---|---|
+| **ERIs** (primitive, `s`–`f`) | match or exceed on **12 of 14** Cartesian shell classes | rel. err ≤ 3×10⁻¹¹; counters show 42–48% fewer retired instructions, 2.5–3× fewer L1 loads |
+| **Coulomb/exchange (J/K)** | **≈2×** faster full contracted build | 8-fold permutational symmetry; linear alkanes **and** compact 3-D DNA fragments |
+| **One-electron S, T, V** | **S ≈1.3–1.4×, T ≈1.1×, V ≈2.1–2.7×** | per-term, min-of-reps; completes the full HF integral set from one OS DAG |
+
+The enabling contribution is a **DAG-topological code emitter**
+([`recursum_dag_emit.py`](benchmarks/eri_libint2/recursum_dag_emit.py)): it expands a
+recurrence into its integral DAG, emits each node once (global common-subexpression
+elimination), and reuses stack slots via peak-liveness allocation — generalising the
+layered code generation of the special-function backends to the four-centre integral
+graph, which the tower-structured backends cannot express. Together with the J/K and
+one-electron machinery, this yields the **full Hartree–Fock integral set** (ERI + S +
+T + V) from a single Obara–Saika DAG framework. See
+[`benchmarks/eri_libint2/REPORT.md`](benchmarks/eri_libint2/REPORT.md) for the full
+methodology, fairness protocol, and findings.
+
+---
+
 ## Day-to-Day Workflow: Adding New Recurrence Relations
 
 This guide shows the **real-world workflow** for implementing new recurrences in your research.
@@ -1288,14 +1322,26 @@ git commit -s -m "Your commit message"
 
 ## Citation
 
-If you use RECURSUM in published research, please cite:
+If you use RECURSUM in published research, please cite both the paper and the
+archived software release:
 
 ```bibtex
-@software{recursum_research,
-  title = {RECURSUM: Automated Code Generation for Recurrence Relations Exceeds Expert Optimization via LayeredCodegen},
-  author = {Authors},
-  year = {2026},
-  url = {https://github.com/rdguerrerom/RECURSUM}
+@article{guerrero_recursum_2026,
+  title   = {RECURSUM: Automatic Generation of High-Performance Kernels for
+             Recurrence Relations},
+  author  = {Guerrero, Rub\'en Dar\'io},
+  journal = {The Journal of Chemical Physics},
+  year    = {2026},
+  note    = {Submitted}
+}
+
+@software{recursum_software,
+  title   = {RECURSUM: Automatic Generation of High-Performance Kernels for
+             Recurrence Relations},
+  author  = {Guerrero, Rub\'en Dar\'io},
+  year    = {2026},
+  version = {1.0.0},
+  url     = {https://github.com/rdguerrerom/RECURSUM}
 }
 ```
 
