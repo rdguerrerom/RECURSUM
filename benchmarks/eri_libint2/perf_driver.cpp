@@ -87,8 +87,9 @@ int main(int argc,char**argv){
     if(impl=="recursum" || impl=="recursum_naive"){
         recursum_fn_t fn=recursum_fn(cl->name, impl=="recursum_naive");
         if(!fn){ fprintf(stderr,"no %s variant for %s (skipped)\n",impl.c_str(),cl->name); return 3; }
+        std::vector<double> sc(RECURSUM_ERI_MAX_NSCRATCH > 0 ? RECURSUM_ERI_MAX_NSCRATCH : 1);
         for(int r=0;r<REPS;r++) for(int i=0;i<NQ;i++){
-            fn(S[i],KF[i].data(),out.data()); sink+=out[0];
+            fn(S[i],KF[i].data(),out.data(),sc.data()); sink+=out[0];  // Uniform scratch (§10.6)
         }
     } else if(impl=="libint2"){
         // build NQ Libint_t evals (prereqs prepped outside timed loop)

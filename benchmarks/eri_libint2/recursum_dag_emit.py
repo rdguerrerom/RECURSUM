@@ -228,13 +228,13 @@ def emit_kernel_chunked(la, lb, lc, ld, suffix="", interior_budget=1200):
                     L.append(f"    fr[{fr_slot[n]}] = v{pos[n]};")
         L.append("}")
 
-    # driver
+    # driver — Uniform scratch (§10.6): the frontier buffer is the caller-owned
+    # `sc` parameter (arena Frame), sized by the emitted `_nscratch` == fr_peak.
     L.append(f"__attribute__((noinline)) void recursum_eri_{name}("
              "const ScalarPack& __restrict__ s, const double* __restrict__ kf, "
-             "double* __restrict__ out) {")
-    L.append(f"    double fr[{max(fr_peak,1)}];")
+             "double* __restrict__ out, double* __restrict__ sc) {")
     for ci in range(len(chunks)):
-        L.append(f"    {name}_c{ci}(s, kf, fr, out);")
+        L.append(f"    {name}_c{ci}(s, kf, sc, out);")
     L.append("}")
     return "\n".join(L), len(outputs_list), len(dag.nodes), fr_peak, len(chunks)
 
@@ -259,15 +259,19 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
     slot, peak = liveness_slots(topo, dag, outputs, reuse=reuse)
 
     name = class_name(la, lb, lc, ld) + suffix
+    # Uniform scratch handoff (SHRIKE spec §10.6): scratch is a caller-owned
+    # __restrict pointer `sc` (from the arena Frame), never a stack-local array.
     L = [f"// ERI class ({name}) [{style}]: {len(outputs_list)} Cartesian integrals, "
          f"{len(dag.nodes)} DAG nodes, peak liveness {peak} slots",
          f"__attribute__((noinline)) void recursum_eri_{name}(",
          "    const ScalarPack& __restrict__ s,",
          "    const double* __restrict__ kf,   // kf[m] = K * F_m(T)",
-         "    double* __restrict__ out) {"]
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {   // caller-owned scratch, >= _nscratch"]
 
     if style == "ssa":
         # name every intermediate node by topo index; compiler handles liveness
+        L.append("    (void)sc;  // ssa style uses named locals, not caller scratch")
         vid = {}
         def refssa(src):
             if src in out_index: return f"out[{out_index[src]}]"
@@ -289,8 +293,9 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
         if src in out_index: return f"out[{out_index[src]}]"
         if not dag.nodes[src]: return f"kf[{src.m}]"
         return f"sc[{slot[src]}]"
-    if peak > 0:
-        L.append(f"    double sc[{peak}];")
+    # `sc` is now the caller-owned parameter (Uniform, §10.6) — no local array.
+    if peak == 0:
+        L.append("    (void)sc;")
     for n in topo:
         if not dag.nodes[n] and n not in outputs:
             continue  # base -> kf[m] (unless it IS an output, e.g. ssss)
@@ -301,6 +306,123 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
             L.append(f"    sc[{slot[n]}] = {rhs};")
     L.append("}")
     return "\n".join(L), len(outputs_list), len(dag.nodes), peak
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 FLAGSHIP: VRR/HRR contraction-boundary split (SHRIKE spec §5.1).
+# The class DAG is partitioned so the primitive-dependent VRR tower runs per
+# primitive while the geometry-only HRR runs ONCE per contracted quartet.
+# Validated equivalent to the fused eval at Python level (plan.md L7).
+# ---------------------------------------------------------------------------
+def split_sets(dag, outputs):
+    """Partition the DAG for the contraction-boundary split.
+
+    Returns (vrr_nodes, hrr_nodes, boundary_list, bidx) where:
+      vrr_nodes  : nodes with L_b==0 and L_d==0 (the (a,0|c,0)^(m) tower;
+                   primitive-dependent — recomputed per primitive).
+      hrr_nodes  : nodes with L_b>0 or L_d>0 (transfer A->B / C->D; geometry
+                   scalars AB/CD only; all at m==0 — contraction-invariant).
+      boundary   : the (a,0|c,0)^(0) intermediates consumed by an HRR node (or
+                   the outputs themselves when lb==ld==0). Contracted across
+                   primitives into e0f0_c[], then read once by the HRR kernel.
+      bidx       : canonical {boundary node -> index} shared by both kernels."""
+    out_set = set(outputs)
+    vrr_nodes = {n for n in dag.nodes if n.L_b == 0 and n.L_d == 0}
+    hrr_nodes = {n for n in dag.nodes if n.L_b > 0 or n.L_d > 0}
+    boundary = set()
+    for n in hrr_nodes:
+        for t in dag.nodes[n]:
+            s = t.source
+            if s.L_b == 0 and s.L_d == 0 and s.m == 0:
+                boundary.add(s)
+    for o in outputs:
+        if o.L_b == 0 and o.L_d == 0 and o.m == 0:
+            boundary.add(o)
+    boundary_list = sorted(boundary)  # Integral is order=True -> deterministic
+    bidx = {n: i for i, n in enumerate(boundary_list)}
+    return vrr_nodes, hrr_nodes, boundary_list, bidx
+
+
+def emit_vrr_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_vrr_<cls>(s, kf, e0f0, sc): builds the (a,0|c,0) tower for
+    ONE primitive and writes the boundary values to e0f0[bidx]. Non-boundary
+    tower nodes use caller scratch sc[] (Uniform, §10.6). Returns
+    (source, n_boundary, vrr_peak)."""
+    outputs = output_set(la, lb, lc, ld)
+    dag = build_dag(outputs)
+    topo = dag.topological_order()
+    vrr_nodes, _hrr, boundary_list, bidx = split_sets(dag, outputs)
+    boundary = set(boundary_list)
+    topo_vrr = [n for n in topo if n in vrr_nodes]
+    # Boundary nodes go to e0f0[]; treat as "outputs" for liveness (no slot reuse).
+    slot, peak = liveness_slots(topo_vrr, dag, boundary, reuse=True)
+
+    name = class_name(la, lb, lc, ld) + suffix
+    def ref(src):
+        if src in bidx:        return f"e0f0[{bidx[src]}]"
+        if not dag.nodes[src]: return f"kf[{src.m}]"
+        return f"sc[{slot[src]}]"
+    L = [f"// VRR tower ({name}): {len(boundary_list)} boundary (a0|c0) ints, "
+         f"peak {peak} slots  [per-primitive; SHRIKE split §5.1]",
+         f"__attribute__((noinline)) void recursum_vrr_{name}(",
+         "    const ScalarPack& __restrict__ s,",
+         "    const double* __restrict__ kf,",
+         "    double* __restrict__ e0f0,   // out: contracted-boundary layout",
+         "    double* __restrict__ sc) {"]
+    if peak == 0:
+        L.append("    (void)sc;")
+    for n in topo_vrr:
+        if not dag.nodes[n] and n not in boundary:
+            continue  # base -> kf[m] (never a boundary unless consumed by HRR)
+        rhs = node_rhs(n, dag, ref)
+        if n in bidx:
+            L.append(f"    e0f0[{bidx[n]}] = {rhs};")
+        elif n in slot:
+            L.append(f"    sc[{slot[n]}] = {rhs};")
+    L.append("}")
+    return "\n".join(L), len(boundary_list), peak
+
+
+def emit_hrr_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_hrr_<cls>(s, e0f0, out, sc): transfers A->B / C->D ONCE on
+    the contracted boundary e0f0[] (read like base integrals) to produce the
+    class outputs. Geometry scalars (AB/CD) only. Returns (source, hrr_peak)."""
+    outputs = output_set(la, lb, lc, ld)
+    out_index = {o: i for i, o in enumerate(outputs)}
+    dag = build_dag(outputs)
+    topo = dag.topological_order()
+    _vrr, hrr_nodes, boundary_list, bidx = split_sets(dag, outputs)
+    topo_hrr = [n for n in topo if n in hrr_nodes]
+    slot, peak = liveness_slots(topo_hrr, dag, set(outputs), reuse=True)
+
+    name = class_name(la, lb, lc, ld) + suffix
+    def ref(src):
+        if src in bidx:          return f"e0f0[{bidx[src]}]"
+        if src in out_index:     return f"out[{out_index[src]}]"
+        return f"sc[{slot[src]}]"
+    L = [f"// HRR transfer ({name}): {len(hrr_nodes)} nodes, peak {peak} slots  "
+         f"[once/contracted-quartet; SHRIKE split §5.1]",
+         f"__attribute__((noinline)) void recursum_hrr_{name}(",
+         "    const ScalarPack& __restrict__ s,",
+         "    const double* __restrict__ e0f0,   // in: contracted boundary",
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {"]
+    if peak == 0:
+        L.append("    (void)sc;")
+    for n in topo_hrr:
+        rhs = node_rhs(n, dag, ref)
+        if n in out_index:
+            L.append(f"    out[{out_index[n]}] = {rhs};")
+        elif n in slot:
+            L.append(f"    sc[{slot[n]}] = {rhs};")
+    L.append("}")
+    return "\n".join(L), peak
+
+
+def has_split(la, lb, lc, ld) -> bool:
+    """The split only helps when there is an HRR stage (lb>0 or ld>0). For
+    (a0|c0) classes it degenerates (boundary==outputs) — use the fused kernel."""
+    return lb > 0 or ld > 0
 
 
 # Canonical class ladder (a>=b, c>=d, a+b<=c+d) up to f-shells. Single source
@@ -317,36 +439,105 @@ CANON_LADDER = [
 CHUNK_THRESHOLD = 10000
 
 
-def emit_dispatch_header(classes) -> str:
+def emit_dispatch_header(classes, split_info=None) -> str:
     """Generate eri_classes.h: the Cls[] table + RECURSUM/naive/name dispatch,
     shared by bench_eri.cpp, perf_driver.cpp and validate_kernels.cpp so the
-    ladder is defined in exactly one place (CANON_LADDER)."""
+    ladder is defined in exactly one place (CANON_LADDER).
+
+    split_info: {class name -> (nbnd, vrr_ns, hrr_ns)} for classes with a Tier-1
+    VRR/HRR split kernel (§5.1); drives the split dispatch + contraction driver."""
+    split_info = split_info or {}
     rows, disp, vdisp = [], [], []
     for cls in classes:
         n = class_name(*cls)
         no = emit_kernel(*cls)[1]
-        rows.append(f'    {{"{n}",{{{cls[0]},{cls[1]},{cls[2]},{cls[3]}}},{no}}},')
+        has_sp = 1 if n in split_info else 0
+        nbnd = split_info[n][0] if n in split_info else 0
+        rows.append(f'    {{"{n}",{{{cls[0]},{cls[1]},{cls[2]},{cls[3]}}},{no},'
+                    f'recursum_eri_{n}_nscratch,{has_sp},{nbnd}}},')
         disp.append(f'    if(!strcmp(c,"{n}")) return recursum_eri_{n};')
-        vdisp.append(f'    if(std::string(c)=="{n}") {{ recursum_eri_{n}(s,kf,out); return; }}')
+        vdisp.append(f'    if(std::string(c)=="{n}") {{ recursum_eri_{n}(s,kf,out,sc); return; }}')
+    # split dispatch: name -> vrr/hrr function pointers
+    vrr_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_vrr_{n};' for n in sorted(split_info))
+    hrr_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_hrr_{n};' for n in sorted(split_info))
     return f"""#pragma once
 // AUTO-GENERATED class table + ON dispatch (from CANON_LADDER). DO NOT EDIT.
 #include <cstring>
 #include <string>
 #include "recursum_eri_scalars.h"
 #include "recursum_eri_decls.h"    // extern kernel declarations (bodies in per-class TUs)
-struct Cls {{ const char* name; int l[4]; int nout; }};
+struct Cls {{ const char* name; int l[4]; int nout; int nscratch;
+             int has_split; int nbnd; }};
 static const Cls ERI_CLASSES[] = {{
 {chr(10).join(rows)}
 }};
 static const int N_ERI_CLASSES = {len(classes)};
-typedef void (*recursum_fn_t)(const ScalarPack&, const double*, double*);
+// Uniform scratch (§10.6): kernels take a caller-owned sc buffer sized by
+// _nscratch; the max over all classes is RECURSUM_ERI_MAX_NSCRATCH (decls.h).
+typedef void (*recursum_fn_t)(const ScalarPack&, const double*, double*, double*);
 static inline recursum_fn_t recursum_dispatch(const char* c){{
 {chr(10).join(disp)}
     return nullptr;
 }}
+// Convenience wrapper: owns a worst-case sc buffer so callers that don't manage
+// an arena (test/bench harnesses) keep a simple 3-arg call. SHRIKE's Engine
+// instead passes arena scratch directly to the 4-arg kernel symbol.
 static inline void recursum_call(const char* c, const ScalarPack& s,
                                  const double* kf, double* out){{
+    double sc[RECURSUM_ERI_MAX_NSCRATCH > 0 ? RECURSUM_ERI_MAX_NSCRATCH : 1];
 {chr(10).join(vdisp)}
+}}
+
+// ---- Tier-1 VRR/HRR contraction-boundary split (§5.1) --------------------
+// vrr: build (a0|c0) boundary for ONE primitive quartet -> e0f0[nbnd].
+// hrr: transfer A->B / C->D ONCE on the contracted boundary -> out[nout].
+typedef void (*recursum_vrr_t)(const ScalarPack&, const double*, double*, double*);
+typedef void (*recursum_hrr_t)(const ScalarPack&, const double*, double*, double*);
+static inline recursum_vrr_t recursum_vrr_dispatch(const char* c){{
+{vrr_disp}
+    return nullptr;  // null => no split for this class (use fused)
+}}
+static inline recursum_hrr_t recursum_hrr_dispatch(const char* c){{
+{hrr_disp}
+    return nullptr;
+}}
+static inline const Cls* recursum_find_cls(const char* c){{
+    for(int i=0;i<N_ERI_CLASSES;i++) if(!strcmp(ERI_CLASSES[i].name,c)) return &ERI_CLASSES[i];
+    return nullptr;
+}}
+// Contracted driver: the SHRIKE §5.1 dispatch. For np primitive quartets,
+// D==1 (segmented) uses the fused kernel BYTE-IDENTICALLY; np>1 with a split
+// available runs VRR np times + HRR ONCE. `s`/`kf` are arrays of length np
+// (per-primitive scalars + prescaled Boys); `sgeom` supplies AB/CD (identical
+// across primitives). sc must hold >= max(nscratch, nbnd) doubles; e0f0_c holds
+// >= nbnd doubles (caller-provided arena scratch).
+static inline void recursum_contracted(const char* c, int np,
+        const ScalarPack* s, const double* const* kf, const ScalarPack& sgeom,
+        double* out, double* sc, double* e0f0_c){{
+    const Cls* cl = recursum_find_cls(c);
+    recursum_vrr_t vrr = recursum_vrr_dispatch(c);
+    if(np == 1 || !vrr || !cl || !cl->has_split){{
+        // segmented / no-split: sum the fused kernel over primitive quartets.
+        for(int i=0;i<cl->nout;i++) out[i]=0.0;
+        double tmp[RECURSUM_ERI_MAX_NSCRATCH>0?RECURSUM_ERI_MAX_NSCRATCH:1];
+        recursum_fn_t fn = recursum_dispatch(c);
+        double acc[16384];
+        for(int p=0;p<np;p++){{
+            fn(s[p], kf[p], acc, tmp);
+            for(int i=0;i<cl->nout;i++) out[i]+=acc[i];
+        }}
+        return;
+    }}
+    recursum_hrr_t hrr = recursum_hrr_dispatch(c);
+    for(int k=0;k<cl->nbnd;k++) e0f0_c[k]=0.0;
+    double e0f0[16384];
+    for(int p=0;p<np;p++){{
+        vrr(s[p], kf[p], e0f0, sc);
+        for(int k=0;k<cl->nbnd;k++) e0f0_c[k]+=e0f0[k];
+    }}
+    hrr(sgeom, e0f0_c, out, sc);
 }}
 """
 
@@ -400,6 +591,7 @@ def generate_project(classes, outdir=".", naive_cap=20000):
     decls = ["#pragma once", "// AUTO-GENERATED extern kernel declarations. DO NOT EDIT.",
              '#include "recursum_eri_scalars.h"']
     skip_naive = set()
+    nscratch = {}   # kernel name -> peak scratch slots (Uniform sc[], §10.6)
     for cls in classes:
         for reuse, suf in ((True, ""), (False, "_naive")):
             n_nodes = emit_kernel(*cls)[2]
@@ -412,7 +604,8 @@ def generate_project(classes, outdir=".", naive_cap=20000):
                 with open(os.path.join(outdir, f"k_{nm}.cpp"), "w") as f:
                     f.write(src + "\n")   # chunked source already #includes scalars
                 tus.append(f"k_{nm}.cpp")
-                decls.append(f"void recursum_eri_{nm}(const ScalarPack&, const double*, double*);")
+                decls.append(f"void recursum_eri_{nm}(const ScalarPack&, const double*, double*, double*);")
+                nscratch[nm] = frp
                 continue
             if not reuse and n_nodes > CHUNK_THRESHOLD:
                 skip_naive.add(class_name(*cls))
@@ -426,12 +619,48 @@ def generate_project(classes, outdir=".", naive_cap=20000):
             with open(os.path.join(outdir, fn), "w") as f:
                 f.write(SCALAR_H + "\n" + src + "\n")
             tus.append(fn)
-            decls.append(f"void recursum_eri_{nm}(const ScalarPack&, const double*, double*);")
+            decls.append(f"void recursum_eri_{nm}(const ScalarPack&, const double*, double*, double*);")
+            nscratch[nm] = pk
     globals()["_SKIP_NAIVE"] = skip_naive
+
+    # --- Tier-1 split kernels (§5.1): VRR tower + HRR transfer, emitted for
+    # classes with a real HRR stage (lb>0 or ld>0). Oversized HRR (ffff-scale,
+    # > CHUNK_THRESHOLD nodes) is deferred to fused-only for now — chunked split
+    # emission is future work; those classes still work via the fused path.
+    split_info = {}   # class name -> (nbnd, vrr_nscratch, hrr_nscratch)
+    for cls in classes:
+        if not has_split(*cls):
+            continue
+        n_nodes = emit_kernel(*cls)[2]
+        if n_nodes > CHUNK_THRESHOLD:
+            continue  # defer split for ffff-scale (single-function HRR too big)
+        nm = class_name(*cls)
+        vsrc, nbnd, vperk = emit_vrr_kernel(*cls)
+        hsrc, hperk = emit_hrr_kernel(*cls)
+        with open(os.path.join(outdir, f"k_{nm}_split.cpp"), "w") as f:
+            f.write(SCALAR_H + "\n" + vsrc + "\n\n" + hsrc + "\n")
+        tus.append(f"k_{nm}_split.cpp")
+        decls.append(f"void recursum_vrr_{nm}(const ScalarPack&, const double*, double*, double*);")
+        decls.append(f"void recursum_hrr_{nm}(const ScalarPack&, const double*, double*, double*);")
+        nscratch[f"vrr_{nm}"] = vperk
+        nscratch[f"hrr_{nm}"] = hperk
+        split_info[nm] = (nbnd, vperk, hperk)
+    globals()["_SPLIT_INFO"] = split_info
+
+    # Per-kernel scratch sizes + the global MAX (spec §10.3 MAX_PEAK_LIVENESS:
+    # the codegen-time constant a SHRIKE arena uses to size its scratch window).
+    for nm in sorted(nscratch):
+        decls.append(f"constexpr int recursum_eri_{nm}_nscratch = {nscratch[nm]};")
+    for nm in sorted(split_info):
+        decls.append(f"constexpr int recursum_{nm}_nbnd = {split_info[nm][0]};")
+    _max_ns = max(nscratch.values()) if nscratch else 0
+    _max_nbnd = max((v[0] for v in split_info.values()), default=0)
+    decls.append(f"constexpr int RECURSUM_ERI_MAX_NSCRATCH = {_max_ns};")
+    decls.append(f"constexpr int RECURSUM_ERI_MAX_NBND = {_max_nbnd};")
     with open(os.path.join(outdir, "recursum_eri_decls.h"), "w") as f:
         f.write("\n".join(decls) + "\n")
     with open(os.path.join(outdir, "eri_classes.h"), "w") as f:
-        f.write(emit_dispatch_header(classes))
+        f.write(emit_dispatch_header(classes, split_info))
     # naive dispatch as its own tiny header (decls already cover the bodies)
     with open(os.path.join(outdir, "recursum_eri_naive_dispatch.h"), "w") as f:
         f.write('#pragma once\n#include "eri_classes.h"\n#include "recursum_eri_decls.h"\n'

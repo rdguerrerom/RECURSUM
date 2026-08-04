@@ -139,9 +139,10 @@ static void BM_RECURSUM(benchmark::State& st, const Cls* cl) {
     ScalarPack s; std::vector<double> kf;
     fill_scalars(s, kf, max_m);
     std::vector<double> out(cl->nout);
+    std::vector<double> sc(RECURSUM_ERI_MAX_NSCRATCH > 0 ? RECURSUM_ERI_MAX_NSCRATCH : 1);
     recursum_fn_t fn = recursum_dispatch(cl->name);  // resolve ONCE, like libint2's fn
     for (auto _ : st) {
-        fn(s, kf.data(), out.data());
+        fn(s, kf.data(), out.data(), sc.data());  // Uniform scratch (§10.6)
         benchmark::DoNotOptimize(out.data());
         benchmark::ClobberMemory();
     }
