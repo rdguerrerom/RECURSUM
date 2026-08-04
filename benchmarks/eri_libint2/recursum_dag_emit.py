@@ -116,11 +116,108 @@ def liveness_slots(topo: List[Integral], dag,
     return slot, next_slot
 
 
+# ---- SymPy algebraic-simplification pass (spec §5.3; open-source, NOT Maple) --
+# Off by default. When enabled, each node's RHS is rebuilt as a SymPy expression,
+# simplified (shared-multiplier factoring + constant folding via factor_terms),
+# and PER-NODE NUMERICALLY VERIFIED equivalent before being emitted; any node
+# that fails verification falls back to the plain expression. This is the
+# fidelity gate the spec requires ("random numeric check per node").
+SYMPY_PASS = False
+_SYMPY_STATS = {"nodes": 0, "simplified": 0, "rejected": 0}
+
+
+def coef_to_sympy(coef, sym):
+    """SymPy analog of coef_to_c: build the coefficient as a SymPy expression
+    over scalar-field symbols (from the `sym` cache). Mirrors coef_to_c exactly."""
+    import sympy
+    def S(name):
+        if name not in sym:
+            sym[name] = sympy.Symbol(name)
+        return sym[name]
+    sfx = None
+    if coef.endswith("_xq"):
+        sfx = S("frac_q_over_pq"); coef = coef[:-3]
+    elif coef.endswith("_xp"):
+        sfx = S("frac_p_over_pq"); coef = coef[:-3]
+    if coef.startswith("ai") and "_inv_2zp" in coef:
+        n = int(coef[2:coef.index("_inv_2zp")]); base = sympy.Integer(n) * S("inv_2zp")
+    elif coef.startswith("ci") and "_inv_2zq" in coef:
+        n = int(coef[2:coef.index("_inv_2zq")]); base = sympy.Integer(n) * S("inv_2zq")
+    elif coef.startswith("ai") and "_inv_2zpq" in coef:
+        n = int(coef[2:coef.index("_inv_2zpq")]); base = sympy.Integer(n) * S("inv_2zpq")
+    elif coef.startswith("ci") and "_inv_2zpq" in coef:
+        n = int(coef[2:coef.index("_inv_2zpq")]); base = sympy.Integer(n) * S("inv_2zpq")
+    elif coef == "one":
+        base = sympy.Integer(1)
+    else:
+        base = S(coef)
+    return base * sfx if sfx is not None else base
+
+
+def _print_c(expr, srcmap):
+    """Emit a restricted SymPy expr (Add/Mul/Symbol/Number/Pow) as C. Scalar
+    symbols -> s.<name>; source symbols -> their caller ref (srcmap)."""
+    import sympy
+    if expr.is_Add:
+        return "(" + " + ".join(_print_c(a, srcmap) for a in expr.as_ordered_terms()) + ")"
+    if expr.is_Mul:
+        return "(" + " * ".join(_print_c(a, srcmap) for a in expr.as_ordered_factors()) + ")"
+    if expr.is_Pow:
+        b, e = expr.as_base_exp()
+        assert e.is_Integer and int(e) >= 1 and int(e) <= 4
+        return "(" + " * ".join([_print_c(b, srcmap)] * int(e)) + ")"
+    if expr.is_Symbol:
+        nm = expr.name
+        return srcmap[nm] if nm in srcmap else f"s.{nm}"
+    if expr.is_Integer:
+        return f"{int(expr)}.0"
+    if expr.is_Rational:
+        return f"({int(expr.p)}.0 / {int(expr.q)}.0)"
+    if expr.is_Float or expr.is_Number:
+        return repr(float(expr))
+    raise ValueError(f"unprintable node in SymPy pass: {expr!r}")
+
+
+def _sympy_node_rhs(terms, reffn):
+    """Simplified C RHS for a node's term list, or None if the pass rejects it."""
+    import sympy
+    sym = {}
+    srcmap = {}       # source-symbol name -> caller ref C string
+    orig = sympy.Integer(0)
+    for i, t in enumerate(terms):
+        sname = f"__S{i}"
+        srcmap[sname] = reffn(t.source)
+        ssym = sympy.Symbol(sname)
+        sym[sname] = ssym
+        orig += sympy.Integer(t.sign) * coef_to_sympy(t.coef, sym) * ssym
+    simplified = sympy.factor_terms(orig)
+    # per-node numeric fidelity gate: random-substitution equivalence check.
+    syms = sorted(sym.values(), key=lambda x: x.name)
+    import random
+    rng = random.Random(0xC0FFEE)
+    for _ in range(6):
+        subs = {s: sympy.Float(rng.uniform(-1.7, 1.9), 17) for s in syms}
+        a = float(orig.xreplace(subs)); b = float(simplified.xreplace(subs))
+        if abs(a - b) > 1e-12 * (abs(a) + 1e-300):
+            return None  # not value-preserving under our printer's semantics -> reject
+    try:
+        return _print_c(simplified, srcmap)
+    except (ValueError, AssertionError):
+        return None
+
+
 def node_rhs(n: Integral, dag, reffn, kf="kf") -> str:
     """C expression for node n's value; reffn(src) names each source."""
     terms = dag.nodes[n]
     if not terms:  # base integral (0000)^(m)
         return f"{kf}[{n.m}]"
+    if SYMPY_PASS:
+        _SYMPY_STATS["nodes"] += 1
+        c = _sympy_node_rhs(terms, reffn)
+        if c is not None:
+            _SYMPY_STATS["simplified"] += 1
+            return c
+        _SYMPY_STATS["rejected"] += 1
     pieces = []
     for t in terms:
         c = coef_to_c(t.coef)
