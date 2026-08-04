@@ -516,6 +516,94 @@ def emit_hrr_kernel(la, lb, lc, ld, suffix=""):
     return "\n".join(L), peak
 
 
+def emit_contracted_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_ctr_<cls>(sp, kfa, cd, mstride, out, sc): the FULL contracted
+    ERI with the primitive-contraction loop INSIDE one generated function — the
+    libint2 `for(c<contrdepth)` structure, but with SHRIKE's DAG-CSE body kept
+    register-resident and HRR done once on the contracted boundary. Replaces the
+    C++ per-primitive orchestration in contract_eri (SHRIKE Engine Lever A), so
+    the per-kernel advantage propagates instead of being spent on call overhead
+    and the e0f0->e0f0c memory round-trip. `sp[c]`/`kfa+c*mstride` are the
+    per-primitive scalars + prescaled Boys; `sc` is caller scratch. Returns
+    (source, nout, nbnd, peak)."""
+    outputs = output_set(la, lb, lc, ld)
+    nout = len(outputs)
+    out_index = {o: i for i, o in enumerate(outputs)}
+    dag = build_dag(outputs)
+    topo = dag.topological_order()
+    name = class_name(la, lb, lc, ld) + suffix
+    split = has_split(la, lb, lc, ld)
+    L = [f"// Contracted kernel ({name}): in-kernel primitive loop (contrdepth) + "
+         f"{'VRR-contract + HRR once' if split else 'fused-accumulate'} "
+         f"[SHRIKE Engine Lever A]",
+         f"__attribute__((noinline)) void recursum_ctr_{name}(",
+         "    const ScalarPack* __restrict__ sp,",
+         "    const double* __restrict__ kfa,",
+         "    int cd, int mstride,",
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {"]
+    if split:
+        vrr_nodes, hrr_nodes, boundary_list, bidx = split_sets(dag, outputs)
+        nbnd = len(boundary_list)
+        boundary = set(boundary_list)
+        topo_vrr = [n for n in topo if n in vrr_nodes]
+        topo_hrr = [n for n in topo if n in hrr_nodes]
+        vslot, vpeak = liveness_slots(topo_vrr, dag, boundary, reuse=True)
+        hslot, hpeak = liveness_slots(topo_hrr, dag, set(outputs), reuse=True)
+        L += [f"    double e0f0c[{nbnd}];",
+              f"    for(int k=0;k<{nbnd};++k) e0f0c[k]=0.0;",
+              "    for(int c=0;c<cd;++c) {",
+              "        const ScalarPack& s = sp[c];",
+              "        const double* kf = kfa + (long)c*mstride;",
+              f"        double e0f0[{nbnd}];"]
+        def vref(src):
+            if src in bidx:        return f"e0f0[{bidx[src]}]"
+            if not dag.nodes[src]: return f"kf[{src.m}]"
+            return f"sc[{vslot[src]}]"
+        for n in topo_vrr:
+            if not dag.nodes[n] and n not in boundary:
+                continue
+            rhs = node_rhs(n, dag, vref)
+            if n in bidx:       L.append(f"        e0f0[{bidx[n]}] = {rhs};")
+            elif n in vslot:    L.append(f"        sc[{vslot[n]}] = {rhs};")
+        L += [f"        for(int k=0;k<{nbnd};++k) e0f0c[k]+=e0f0[k];",
+              "    }",
+              "    { const ScalarPack& s = sp[0]; (void)s;"]
+        def href(src):
+            if src in bidx:      return f"e0f0c[{bidx[src]}]"
+            if src in out_index: return f"out[{out_index[src]}]"
+            if not dag.nodes[src]: return f"kf[{src.m}]"
+            return f"sc[{hslot[src]}]"
+        for n in topo_hrr:
+            rhs = node_rhs(n, dag, href)
+            if n in out_index:  L.append(f"      out[{out_index[n]}] = {rhs};")
+            elif n in hslot:    L.append(f"      sc[{hslot[n]}] = {rhs};")
+        L.append("    }")
+        peak, nbnd_ret = max(vpeak, hpeak), nbnd
+    else:
+        slot, peak = liveness_slots(topo, dag, set(outputs), reuse=True)
+        L += [f"    for(int k=0;k<{nout};++k) out[k]=0.0;",
+              "    for(int c=0;c<cd;++c) {",
+              "        const ScalarPack& s = sp[c];",
+              "        const double* kf = kfa + (long)c*mstride;",
+              f"        double o[{nout}];"]
+        def fref(src):
+            if src in out_index:   return f"o[{out_index[src]}]"
+            if not dag.nodes[src]: return f"kf[{src.m}]"
+            return f"sc[{slot[src]}]"
+        for n in topo:
+            if not dag.nodes[n] and n not in out_index:
+                continue
+            rhs = node_rhs(n, dag, fref)
+            if n in out_index:  L.append(f"        o[{out_index[n]}] = {rhs};")
+            elif n in slot:     L.append(f"        sc[{slot[n]}] = {rhs};")
+        L += [f"        for(int k=0;k<{nout};++k) out[k]+=o[k];",
+              "    }"]
+        nbnd_ret = 0
+    L.append("}")
+    return "\n".join(L), nout, nbnd_ret, peak
+
+
 def has_split(la, lb, lc, ld) -> bool:
     """The split only helps when there is an HRR stage (lb>0 or ld>0). For
     (a0|c0) classes it degenerates (boundary==outputs) — use the fused kernel."""
@@ -536,7 +624,7 @@ CANON_LADDER = [
 CHUNK_THRESHOLD = 10000
 
 
-def emit_dispatch_header(classes, split_info=None) -> str:
+def emit_dispatch_header(classes, split_info=None, ctr_info=None) -> str:
     """Generate eri_classes.h: the Cls[] table + RECURSUM/naive/name dispatch,
     shared by bench_eri.cpp, perf_driver.cpp and validate_kernels.cpp so the
     ladder is defined in exactly one place (CANON_LADDER).
@@ -544,6 +632,7 @@ def emit_dispatch_header(classes, split_info=None) -> str:
     split_info: {class name -> (nbnd, vrr_ns, hrr_ns)} for classes with a Tier-1
     VRR/HRR split kernel (§5.1); drives the split dispatch + contraction driver."""
     split_info = split_info or {}
+    ctr_info = ctr_info or {}
     rows, disp, vdisp = [], [], []
     for cls in classes:
         n = class_name(*cls)
@@ -559,6 +648,8 @@ def emit_dispatch_header(classes, split_info=None) -> str:
         f'    if(!strcmp(c,"{n}")) return recursum_vrr_{n};' for n in sorted(split_info))
     hrr_disp = "\n".join(
         f'    if(!strcmp(c,"{n}")) return recursum_hrr_{n};' for n in sorted(split_info))
+    ctr_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_ctr_{n};' for n in sorted(ctr_info))
     return f"""#pragma once
 // AUTO-GENERATED class table + ON dispatch (from CANON_LADDER). DO NOT EDIT.
 #include <cstring>
@@ -598,6 +689,16 @@ static inline recursum_vrr_t recursum_vrr_dispatch(const char* c){{
 }}
 static inline recursum_hrr_t recursum_hrr_dispatch(const char* c){{
 {hrr_disp}
+    return nullptr;
+}}
+// ---- Contracted kernels (SHRIKE Engine Lever A) --------------------------
+// One call per contracted quartet: in-kernel primitive loop (contrdepth) with
+// VRR-contract + HRR once (split classes) or fused-accumulate (a0|c0 classes).
+// sp/kfa are arrays of `cd` per-primitive scalars/Boys; kfa is row-major with
+// `mstride` doubles per primitive. sc = caller scratch (>= nscratch doubles).
+typedef void (*recursum_ctr_t)(const ScalarPack*, const double*, int, int, double*, double*);
+static inline recursum_ctr_t recursum_ctr_dispatch(const char* c){{
+{ctr_disp}
     return nullptr;
 }}
 static inline const Cls* recursum_find_cls(const char* c){{
@@ -744,6 +845,26 @@ def generate_project(classes, outdir=".", naive_cap=20000):
         split_info[nm] = (nbnd, vperk, hperk)
     globals()["_SPLIT_INFO"] = split_info
 
+    # --- Contracted kernels (SHRIKE Engine Lever A): in-kernel primitive loop
+    # (libint2 contrdepth structure) for EVERY class up to CHUNK_THRESHOLD. The
+    # Engine calls ONE ctr kernel per contracted quartet instead of orchestrating
+    # per-primitive VRR calls + accumulation in C++.
+    ctr_info = {}   # class name -> ctr scratch peak
+    for cls in classes:
+        n_nodes = emit_kernel(*cls)[2]
+        if n_nodes > CHUNK_THRESHOLD:
+            continue  # ffff-scale: fused/C++-contracted path only
+        nm = class_name(*cls)
+        csrc, cno, cnbnd, cperk = emit_contracted_kernel(*cls)
+        with open(os.path.join(outdir, f"k_{nm}_ctr.cpp"), "w") as f:
+            f.write(SCALAR_H + "\n" + csrc + "\n")
+        tus.append(f"k_{nm}_ctr.cpp")
+        decls.append(f"void recursum_ctr_{nm}(const ScalarPack*, const double*, "
+                     f"int, int, double*, double*);")
+        nscratch[f"ctr_{nm}"] = cperk
+        ctr_info[nm] = cperk
+    globals()["_CTR_INFO"] = ctr_info
+
     # Per-kernel scratch sizes + the global MAX (spec §10.3 MAX_PEAK_LIVENESS:
     # the codegen-time constant a SHRIKE arena uses to size its scratch window).
     for nm in sorted(nscratch):
@@ -757,7 +878,7 @@ def generate_project(classes, outdir=".", naive_cap=20000):
     with open(os.path.join(outdir, "recursum_eri_decls.h"), "w") as f:
         f.write("\n".join(decls) + "\n")
     with open(os.path.join(outdir, "eri_classes.h"), "w") as f:
-        f.write(emit_dispatch_header(classes, split_info))
+        f.write(emit_dispatch_header(classes, split_info, ctr_info))
     # naive dispatch as its own tiny header (decls already cover the bodies)
     with open(os.path.join(outdir, "recursum_eri_naive_dispatch.h"), "w") as f:
         f.write('#pragma once\n#include "eri_classes.h"\n#include "recursum_eri_decls.h"\n'
