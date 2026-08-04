@@ -604,6 +604,125 @@ def emit_contracted_kernel(la, lb, lc, ld, suffix=""):
     return "\n".join(L), nout, nbnd_ret, peak
 
 
+def emit_contracted_kernel_simd(la, lb, lc, ld, V=4, suffix=""):
+    """Emit recursum_ctrv_<cls>: the contracted kernel VECTORISED across primitive
+    quartets (SHRIKE Engine Lever B). Lanes = V primitives; every ScalarPack field
+    / Boys value / intermediate becomes a `recursum_vdbl` (GCC vector ext), so the
+    SAME DAG-CSE body runs V-wide. libint2 is scalar (VECLEN=1) — this is the jump
+    past it. The VRR contraction accumulates a vector boundary; lanes are
+    horizontally reduced ONCE before the (scalar) HRR. `spv`/`kfa` are AoSoA blocks
+    of V primitives; `sgeom` gives the (primitive-invariant) HRR geometry. Returns
+    (source, nout)."""
+    outputs = output_set(la, lb, lc, ld)
+    nout = len(outputs)
+    out_index = {o: i for i, o in enumerate(outputs)}
+    dag = build_dag(outputs)
+    topo = dag.topological_order()
+    name = class_name(la, lb, lc, ld) + suffix
+    split = has_split(la, lb, lc, ld)
+    L = [f"// Contracted SIMD kernel ({name}): {V}-wide across primitives (GCC "
+         f"vector ext); libint2 is scalar VECLEN=1 [SHRIKE Engine Lever B]",
+         f"__attribute__((noinline)) void recursum_ctrv_{name}(",
+         "    const ScalarPackV* __restrict__ spv,",
+         "    const recursum_vdbl* __restrict__ kfa,",
+         "    int nblk, int mstride,",
+         "    const ScalarPack& __restrict__ sgeom,",
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {",
+         "    const recursum_vdbl VZERO = {0.0,0.0,0.0,0.0};"]
+    if split:
+        vrr_nodes, hrr_nodes, boundary_list, bidx = split_sets(dag, outputs)
+        nbnd = len(boundary_list)
+        boundary = set(boundary_list)
+        topo_vrr = [n for n in topo if n in vrr_nodes]
+        topo_hrr = [n for n in topo if n in hrr_nodes]
+        vslot, vpeak = liveness_slots(topo_vrr, dag, boundary, reuse=True)
+        hslot, hpeak = liveness_slots(topo_hrr, dag, set(outputs), reuse=True)
+        L += [f"    recursum_vdbl e0f0c[{nbnd}];",
+              f"    for(int k=0;k<{nbnd};++k) e0f0c[k]=VZERO;",
+              "    for(int b=0;b<nblk;++b) {",
+              "        const ScalarPackV& s = spv[b];",
+              "        const recursum_vdbl* kf = kfa + (long)b*mstride;",
+              f"        recursum_vdbl e0f0[{nbnd}];"]
+        if vpeak > 0:
+            L.append(f"        recursum_vdbl scv[{vpeak}];")
+        def vref(src):
+            if src in bidx:        return f"e0f0[{bidx[src]}]"
+            if not dag.nodes[src]: return f"kf[{src.m}]"
+            return f"scv[{vslot[src]}]"
+        for n in topo_vrr:
+            if not dag.nodes[n] and n not in boundary:
+                continue
+            rhs = node_rhs(n, dag, vref)
+            if n in bidx:    L.append(f"        e0f0[{bidx[n]}] = {rhs};")
+            elif n in vslot: L.append(f"        scv[{vslot[n]}] = {rhs};")
+        L += [f"        for(int k=0;k<{nbnd};++k) e0f0c[k]+=e0f0[k];",
+              "    }",
+              f"    double e0f0cs[{nbnd}];",
+              f"    for(int k=0;k<{nbnd};++k){{ recursum_vdbl v=e0f0c[k]; double t=0;"
+              f" for(int jL=0;jL<{V};++jL) t+=v[jL]; e0f0cs[k]=t; }}",
+              "    { const ScalarPack& s = sgeom; (void)s;"]
+        def href(src):
+            if src in bidx:      return f"e0f0cs[{bidx[src]}]"
+            if src in out_index: return f"out[{out_index[src]}]"
+            return f"sc[{hslot[src]}]"
+        for n in topo_hrr:
+            rhs = node_rhs(n, dag, href)
+            if n in out_index: L.append(f"      out[{out_index[n]}] = {rhs};")
+            elif n in hslot:   L.append(f"      sc[{hslot[n]}] = {rhs};")
+        L.append("    }")
+    else:
+        slot, peak = liveness_slots(topo, dag, set(outputs), reuse=True)
+        L += ["    (void)sgeom; (void)sc;",
+              f"    recursum_vdbl accv[{nout}];",
+              f"    for(int k=0;k<{nout};++k) accv[k]=VZERO;",
+              "    for(int b=0;b<nblk;++b) {",
+              "        const ScalarPackV& s = spv[b];",
+              "        const recursum_vdbl* kf = kfa + (long)b*mstride;",
+              f"        recursum_vdbl o[{nout}];"]
+        if peak > 0:
+            L.append(f"        recursum_vdbl scv[{peak}];")
+        def fref(src):
+            if src in out_index:   return f"o[{out_index[src]}]"
+            if not dag.nodes[src]: return f"kf[{src.m}]"
+            return f"scv[{slot[src]}]"
+        for n in topo:
+            if not dag.nodes[n] and n not in out_index:
+                continue
+            rhs = node_rhs(n, dag, fref)
+            if n in out_index: L.append(f"        o[{out_index[n]}] = {rhs};")
+            elif n in slot:    L.append(f"        scv[{slot[n]}] = {rhs};")
+        L += [f"        for(int k=0;k<{nout};++k) accv[k]+=o[k];",
+              "    }",
+              f"    for(int k=0;k<{nout};++k){{ recursum_vdbl v=accv[k]; double t=0;"
+              f" for(int jL=0;jL<{V};++jL) t+=v[jL]; out[k]=t; }}"]
+    L.append("}")
+    return "\n".join(L), nout
+
+
+def emit_simd_header() -> str:
+    """recursum_eri_simd.h: the V-wide vector type + AoSoA ScalarPackV (fields
+    mirror ScalarPack exactly, so the emitted vector body is textually identical
+    to the scalar one)."""
+    fields = ("PAx PAy PAz QCx QCy QCz WPx WPy WPz WQx WQy WQz "
+              "ABx ABy ABz CDx CDy CDz inv_2zp inv_2zq inv_2zpq "
+              "frac_q_over_pq frac_p_over_pq").split()
+    decl = "    recursum_vdbl " + ", ".join(fields) + ";"
+    return ("#pragma once\n"
+            "// AUTO-GENERATED SIMD types for the contracted vector kernels "
+            "(Lever B). DO NOT EDIT.\n"
+            '#include "recursum_eri_scalars.h"\n'
+            "// 4-wide double (AVX2 under -march=native; splits to SSE otherwise). "
+            "Both are correct.\n"
+            "// aligned(8): use UNALIGNED loads (vmovupd) so the AoSoA scratch need "
+            "not be 32-byte aligned\n"
+            "// (std::vector storage isn't guaranteed over-aligned). Negligible cost "
+            "on AVX2+.\n"
+            "typedef double recursum_vdbl __attribute__((vector_size(32), aligned(8)));\n"
+            "#define RECURSUM_VLEN 4\n"
+            "struct ScalarPackV {\n" + decl + "\n};\n")
+
+
 def has_split(la, lb, lc, ld) -> bool:
     """The split only helps when there is an HRR stage (lb>0 or ld>0). For
     (a0|c0) classes it degenerates (boundary==outputs) — use the fused kernel."""
@@ -650,6 +769,8 @@ def emit_dispatch_header(classes, split_info=None, ctr_info=None) -> str:
         f'    if(!strcmp(c,"{n}")) return recursum_hrr_{n};' for n in sorted(split_info))
     ctr_disp = "\n".join(
         f'    if(!strcmp(c,"{n}")) return recursum_ctr_{n};' for n in sorted(ctr_info))
+    ctrv_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_ctrv_{n};' for n in sorted(ctr_info))
     return f"""#pragma once
 // AUTO-GENERATED class table + ON dispatch (from CANON_LADDER). DO NOT EDIT.
 #include <cstring>
@@ -699,6 +820,13 @@ static inline recursum_hrr_t recursum_hrr_dispatch(const char* c){{
 typedef void (*recursum_ctr_t)(const ScalarPack*, const double*, int, int, double*, double*);
 static inline recursum_ctr_t recursum_ctr_dispatch(const char* c){{
 {ctr_disp}
+    return nullptr;
+}}
+// SIMD contracted kernels (Lever B): V-wide across primitives (AoSoA ScalarPackV).
+typedef void (*recursum_ctrv_t)(const ScalarPackV*, const recursum_vdbl*, int, int,
+                                const ScalarPack&, double*, double*);
+static inline recursum_ctrv_t recursum_ctrv_dispatch(const char* c){{
+{ctrv_disp}
     return nullptr;
 }}
 static inline const Cls* recursum_find_cls(const char* c){{
@@ -787,7 +915,7 @@ def generate_project(classes, outdir=".", naive_cap=20000):
     import os
     tus = []
     decls = ["#pragma once", "// AUTO-GENERATED extern kernel declarations. DO NOT EDIT.",
-             '#include "recursum_eri_scalars.h"']
+             '#include "recursum_eri_scalars.h"', '#include "recursum_eri_simd.h"']
     skip_naive = set()
     nscratch = {}   # kernel name -> peak scratch slots (Uniform sc[], §10.6)
     for cls in classes:
@@ -863,7 +991,16 @@ def generate_project(classes, outdir=".", naive_cap=20000):
                      f"int, int, double*, double*);")
         nscratch[f"ctr_{nm}"] = cperk
         ctr_info[nm] = cperk
+        # SIMD variant (Lever B): V-wide across primitives.
+        vsrc, _vno = emit_contracted_kernel_simd(*cls)
+        with open(os.path.join(outdir, f"k_{nm}_ctrv.cpp"), "w") as f:
+            f.write('#include "recursum_eri_simd.h"\n' + vsrc + "\n")
+        tus.append(f"k_{nm}_ctrv.cpp")
+        decls.append(f"void recursum_ctrv_{nm}(const ScalarPackV*, const recursum_vdbl*, "
+                     f"int, int, const ScalarPack&, double*, double*);")
     globals()["_CTR_INFO"] = ctr_info
+    with open(os.path.join(outdir, "recursum_eri_simd.h"), "w") as f:
+        f.write(emit_simd_header())
 
     # Per-kernel scratch sizes + the global MAX (spec §10.3 MAX_PEAK_LIVENESS:
     # the codegen-time constant a SHRIKE arena uses to size its scratch window).
