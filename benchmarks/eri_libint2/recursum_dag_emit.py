@@ -405,6 +405,74 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
     return "\n".join(L), len(outputs_list), len(dag.nodes), peak
 
 
+def grad_output_layout(la, lb, lc, ld):
+    """AUGMENTED value+gradient output layout (spec §8.3). Returns
+    (outputs_flat, sections) where outputs_flat is the value block followed by the
+    raised (+1) and lowered (-1) blocks for the three explicit centres A,B,C
+    (the 4th centre D is recovered by translational invariance §8.2). sections
+    maps name -> (start, count, class) so the caller/digestion knows each block's
+    offset. Centres with l==0 have no lowered block. Building ONE DAG over the
+    whole list lets global CSE share the value sub-DAG across every derivative
+    output -- the codegen win a per-derivative kernel throws away."""
+    Ls = [la, lb, lc, ld]
+    outs = []
+    sections = {}
+    def add(name, cls):
+        o = output_set(*cls)
+        sections[name] = (len(outs), len(o), cls)
+        outs.extend(o)
+    add("val", (la, lb, lc, ld))
+    for ci, cn in enumerate(["A", "B", "C"]):
+        up = list(Ls); up[ci] += 1
+        add("up" + cn, tuple(up))
+        if Ls[ci] >= 1:
+            dn = list(Ls); dn[ci] -= 1
+            add("dn" + cn, tuple(dn))
+    return outs, sections
+
+
+def emit_grad_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_grad_<cls>: ONE augmented value+gradient kernel (spec §8.3).
+
+    Produces the value block AND the raised/lowered shift blocks for centres
+    A,B,C in a single straight-line body over ONE DAG -- global CSE shares the
+    value sub-DAG with every derivative output (only the top angular-momentum
+    layer of the VRR is new; marginal cost << the naive per-derivative 9x). The
+    C++ side forms d/dX_c = 2*alpha * up(a+1_c) - a_c * dn(a-1_c) from the
+    sections (the 2*alpha is applied at contraction, spec §8.4). ssa style
+    (named locals; gcc does liveness). Returns (source, sections, nout, nnodes)."""
+    outputs_list, sections = grad_output_layout(la, lb, lc, ld)
+    outputs = set(outputs_list)
+    out_index = {o: i for i, o in enumerate(outputs_list)}
+    dag = build_dag(outputs_list)
+    topo = dag.topological_order()
+    slot, _peak = liveness_slots(topo, dag, outputs, reuse=True)
+    name = class_name(la, lb, lc, ld) + suffix
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cls) in sections.items())
+    L = [f"// AUGMENTED value+gradient kernel ({name}) [§8.3]: {len(outputs_list)} outputs, "
+         f"{len(dag.nodes)} DAG nodes",
+         f"//   sections: {hdr}",
+         f"__attribute__((noinline)) void recursum_grad_{name}(",
+         "    const ScalarPack& __restrict__ s,",
+         "    const double* __restrict__ kf,   // kf[m] = K * F_m(T)",
+         "    double* __restrict__ out) {",
+         "    (void)s;"]
+    vid = {}
+    def refssa(src):
+        if src in out_index: return f"out[{out_index[src]}]"
+        if not dag.nodes[src]: return f"kf[{src.m}]"
+        return vid[src]
+    for i, n in enumerate(topo):
+        if not dag.nodes[n] and n not in outputs:
+            continue
+        if n in outputs:
+            L.append(f"    out[{out_index[n]}] = {node_rhs(n, dag, refssa)};")
+        elif n in slot:
+            vid[n] = f"v{i}"
+            L.append(f"    const double v{i} = {node_rhs(n, dag, refssa)};")
+    L.append("}")
+    return "\n".join(L), sections, len(outputs_list), len(dag.nodes)
+
 # ---------------------------------------------------------------------------
 # Tier-1 FLAGSHIP: VRR/HRR contraction-boundary split (SHRIKE spec §5.1).
 # The class DAG is partitioned so the primitive-dependent VRR tower runs per
