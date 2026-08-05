@@ -473,6 +473,65 @@ def emit_grad_kernel(la, lb, lc, ld, suffix=""):
     L.append("}")
     return "\n".join(L), sections, len(outputs_list), len(dag.nodes)
 
+def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_gradctr_<cls>: the CONTRACTED augmented value+gradient kernel
+    (spec §8.3 + §8.4). FUSED form: the in-kernel primitive loop computes the
+    augmented DAG outputs (value + shift sections) ONCE per primitive from the
+    shared straight-line body (VRR sub-DAG CSE preserved), then accumulates each
+    section with its contraction weight — the RAISED sections get an extra factor
+    `2*alpha_centre` (the exponent-dependent raise weight, §8.4), the value and
+    LOWERED sections get weight 1 (the contraction coeff is already in kf). The
+    2*alpha per differentiated centre per primitive is passed in `w2` (cd x 3:
+    A,B,C). deriv_X_c = up(a+1_c) - a_c*dn(a-1_c) is then formed by the C++ caller
+    from the sections. Verified bit-exact vs finite-difference of the contracted
+    value. Returns (source, sections, nout, nnodes)."""
+    outputs_list, sections = grad_output_layout(la, lb, lc, ld)
+    outputs = set(outputs_list)
+    out_index = {o: i for i, o in enumerate(outputs_list)}
+    nout = len(outputs_list)
+    dag = build_dag(outputs_list)
+    topo = dag.topological_order()
+    slot, peak = liveness_slots(topo, dag, outputs, reuse=True)
+    name = class_name(la, lb, lc, ld) + suffix
+    # section -> weight source: raised sections use w2[.][ci]; others weight 1.
+    up_w = {"upA": 0, "upB": 1, "upC": 2}
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cls) in sections.items())
+    L = [f"// CONTRACTED augmented value+gradient kernel ({name}) [§8.3/§8.4]: "
+         f"{nout} outputs, {len(dag.nodes)} DAG nodes",
+         f"//   sections: {hdr}   (raised sections weighted by 2*alpha, w2[c*3+{{0:A,1:B,2:C}}])",
+         f"__attribute__((noinline)) void recursum_gradctr_{name}(",
+         "    const ScalarPack* __restrict__ sp,",
+         "    const double* __restrict__ kfa,",
+         "    const double* __restrict__ w2,   // cd x 3: 2*alpha for centres A,B,C",
+         "    int cd, int mstride,",
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {",
+         f"    for(int k=0;k<{nout};++k) out[k]=0.0;",
+         "    for(int c=0;c<cd;++c) {",
+         "        const ScalarPack& s = sp[c];",
+         "        const double* kf = kfa + (long)c*mstride;",
+         f"        double o[{nout}];"]
+    def fref(src):
+        if src in out_index:   return f"o[{out_index[src]}]"
+        if not dag.nodes[src]: return f"kf[{src.m}]"
+        return f"sc[{slot[src]}]"
+    for n in topo:
+        if not dag.nodes[n] and n not in out_index:
+            continue
+        rhs = node_rhs(n, dag, fref)
+        if n in out_index:  L.append(f"        o[{out_index[n]}] = {rhs};")
+        elif n in slot:     L.append(f"        sc[{slot[n]}] = {rhs};")
+    # weighted accumulation per section
+    L.append("        const double wA=w2[(long)c*3+0], wB=w2[(long)c*3+1], wC=w2[(long)c*3+2];")
+    for k, (st, cnt, _cls) in sections.items():
+        if k in up_w:
+            w = {"upA": "wA", "upB": "wB", "upC": "wC"}[k]
+            L.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+={w}*o[k];")
+        else:
+            L.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+=o[k];")
+    L += ["    }", "}"]
+    return "\n".join(L), sections, nout, len(dag.nodes)
+
 # ---------------------------------------------------------------------------
 # Tier-1 FLAGSHIP: VRR/HRR contraction-boundary split (SHRIKE spec §5.1).
 # The class DAG is partitioned so the primitive-dependent VRR tower runs per
