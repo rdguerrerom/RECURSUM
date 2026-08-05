@@ -870,7 +870,7 @@ CANON_LADDER = [
 CHUNK_THRESHOLD = 10000
 
 
-def emit_dispatch_header(classes, split_info=None, ctr_info=None) -> str:
+def emit_dispatch_header(classes, split_info=None, ctr_info=None, gradctr_info=None) -> str:
     """Generate eri_classes.h: the Cls[] table + RECURSUM/naive/name dispatch,
     shared by bench_eri.cpp, perf_driver.cpp and validate_kernels.cpp so the
     ladder is defined in exactly one place (CANON_LADDER).
@@ -879,6 +879,7 @@ def emit_dispatch_header(classes, split_info=None, ctr_info=None) -> str:
     VRR/HRR split kernel (§5.1); drives the split dispatch + contraction driver."""
     split_info = split_info or {}
     ctr_info = ctr_info or {}
+    gradctr_info = gradctr_info or {}
     rows, disp, vdisp = [], [], []
     for cls in classes:
         n = class_name(*cls)
@@ -898,6 +899,12 @@ def emit_dispatch_header(classes, split_info=None, ctr_info=None) -> str:
         f'    if(!strcmp(c,"{n}")) return recursum_ctr_{n};' for n in sorted(ctr_info))
     ctrv_disp = "\n".join(
         f'    if(!strcmp(c,"{n}")) return recursum_ctrv_{n};' for n in sorted(ctr_info))
+    gradctr_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_gradctr_{n};' for n in sorted(gradctr_info))
+    grad_nout_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_grad_{n}_nout;' for n in sorted(gradctr_info))
+    grad_mmax_disp = "\n".join(
+        f'    if(!strcmp(c,"{n}")) return recursum_grad_{n}_mmax;' for n in sorted(gradctr_info))
     return f"""#pragma once
 // AUTO-GENERATED class table + ON dispatch (from CANON_LADDER). DO NOT EDIT.
 #include <cstring>
@@ -955,6 +962,24 @@ typedef void (*recursum_ctrv_t)(const ScalarPackV*, const recursum_vdbl*, int, i
 static inline recursum_ctrv_t recursum_ctrv_dispatch(const char* c){{
 {ctrv_disp}
     return nullptr;
+}}
+// ---- Augmented value+gradient contracted kernels (§8.3/§8.4) --------------
+// One call per contracted quartet -> value + shift sections in out[]; raised
+// sections α-weighted via w2[cd*3] (2*alpha for centres A,B,C). Section offsets
+// are computed caller-side from (la,lb,lc,ld). nout/mmax dispatched below.
+typedef void (*recursum_gradctr_t)(const ScalarPack*, const double*, const double*,
+                                   int, int, double*, double*);
+static inline recursum_gradctr_t recursum_gradctr_dispatch(const char* c){{
+{gradctr_disp}
+    return nullptr;
+}}
+static inline int recursum_grad_nout(const char* c){{
+{grad_nout_disp}
+    return 0;
+}}
+static inline int recursum_grad_mmax(const char* c){{
+{grad_mmax_disp}
+    return 0;
 }}
 static inline const Cls* recursum_find_cls(const char* c){{
     for(int i=0;i<N_ERI_CLASSES;i++) if(!strcmp(ERI_CLASSES[i].name,c)) return &ERI_CLASSES[i];
@@ -1126,6 +1151,30 @@ def generate_project(classes, outdir=".", naive_cap=20000):
         decls.append(f"void recursum_ctrv_{nm}(const ScalarPackV*, const recursum_vdbl*, "
                      f"int, int, const ScalarPack&, double*, double*);")
     globals()["_CTR_INFO"] = ctr_info
+
+    # --- Augmented value+gradient contracted kernels (§8.3/§8.4): ONE kernel per
+    # class producing value + shift sections, raised sections α-weighted at
+    # contraction. Guarded like ctr (skip ffff-scale augmented kernels; they need
+    # the liveness chunker, future work). The C++ grad-Engine calls one per quartet.
+    from eri_dag.dag import build_dag as _bdag
+    gradctr_info = {}   # class name -> (nout, mmax, nscratch)
+    for cls in classes:
+        if emit_kernel(*cls)[2] > CHUNK_THRESHOLD:
+            continue
+        nm = class_name(*cls)
+        gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
+        _aug_outs = grad_output_layout(*cls)[0]
+        _mmax = _bdag(_aug_outs).max_m()
+        _slot, _gperk = liveness_slots(_bdag(_aug_outs).topological_order(),
+                                       _bdag(_aug_outs), set(_aug_outs), reuse=True)
+        with open(os.path.join(outdir, f"k_{nm}_gradctr.cpp"), "w") as f:
+            f.write(SCALAR_H + "\n" + gsrc + "\n")
+        tus.append(f"k_{nm}_gradctr.cpp")
+        decls.append(f"void recursum_gradctr_{nm}(const ScalarPack*, const double*, "
+                     f"const double*, int, int, double*, double*);")
+        nscratch[f"gradctr_{nm}"] = max(_gperk, 1)
+        gradctr_info[nm] = (gnout, _mmax, max(_gperk, 1))
+    globals()["_GRADCTR_INFO"] = gradctr_info
     with open(os.path.join(outdir, "recursum_eri_simd.h"), "w") as f:
         f.write(emit_simd_header())
 
@@ -1135,6 +1184,10 @@ def generate_project(classes, outdir=".", naive_cap=20000):
         decls.append(f"constexpr int recursum_eri_{nm}_nscratch = {nscratch[nm]};")
     for nm in sorted(split_info):
         decls.append(f"constexpr int recursum_{nm}_nbnd = {split_info[nm][0]};")
+    for nm in sorted(gradctr_info):
+        gn, gm, gs = gradctr_info[nm]
+        decls.append(f"constexpr int recursum_grad_{nm}_nout = {gn};")
+        decls.append(f"constexpr int recursum_grad_{nm}_mmax = {gm};")
     _max_ns = max(nscratch.values()) if nscratch else 0
     _max_nbnd = max((v[0] for v in split_info.values()), default=0)
     decls.append(f"constexpr int RECURSUM_ERI_MAX_NSCRATCH = {_max_ns};")
@@ -1142,7 +1195,7 @@ def generate_project(classes, outdir=".", naive_cap=20000):
     with open(os.path.join(outdir, "recursum_eri_decls.h"), "w") as f:
         f.write("\n".join(decls) + "\n")
     with open(os.path.join(outdir, "eri_classes.h"), "w") as f:
-        f.write(emit_dispatch_header(classes, split_info, ctr_info))
+        f.write(emit_dispatch_header(classes, split_info, ctr_info, gradctr_info))
     # naive dispatch as its own tiny header (decls already cover the bodies)
     with open(os.path.join(outdir, "recursum_eri_naive_dispatch.h"), "w") as f:
         f.write('#pragma once\n#include "eri_classes.h"\n#include "recursum_eri_decls.h"\n'
