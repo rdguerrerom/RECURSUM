@@ -535,11 +535,7 @@ def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
 def grad_has_split(la, lb, lc, ld) -> bool:
     """The augmented gradient DAG benefits from the split iff some section carries
     an HRR stage. Since upB raises l_b (and upC raises l_d), an HRR stage exists
-    for essentially every non-(ss|ss) class; gate on real HRR node count instead.
-    SHRIKE_GRAD_NOSPLIT=1 forces the fused form for A/B split-vs-fused benchmarking."""
-    import os as _os
-    if _os.environ.get("SHRIKE_GRAD_NOSPLIT") == "1":
-        return False
+    for essentially every non-(ss|ss) class; gate on real HRR node count instead."""
     outs, _ = grad_output_layout(la, lb, lc, ld)
     dag = build_dag(outs)
     _v, hrr, _b, _i = split_sets(dag, set(outs))
