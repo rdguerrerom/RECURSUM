@@ -532,115 +532,6 @@ def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
     L += ["    }", "}"]
     return "\n".join(L), sections, nout, len(dag.nodes)
 
-def grad_has_split(la, lb, lc, ld) -> bool:
-    """The augmented gradient DAG benefits from the split iff some section carries
-    an HRR stage. Since upB raises l_b (and upC raises l_d), an HRR stage exists
-    for essentially every non-(ss|ss) class; gate on real HRR node count instead."""
-    outs, _ = grad_output_layout(la, lb, lc, ld)
-    dag = build_dag(outs)
-    _v, hrr, _b, _i = split_sets(dag, set(outs))
-    return len(hrr) >= 8   # tiny-HRR classes stay fused (call/setup not worth it)
-
-
-def emit_gradctr_split_kernel(la, lb, lc, ld, suffix=""):
-    """SPLIT augmented value+gradient kernel (spec §8.3/§8.4 + the §5.1 split applied
-    to the gradient DAG — task #13). Instead of recomputing the WHOLE augmented DAG
-    per primitive (the fused recursum_gradctr), it runs the VRR (a0|c0) tower per
-    primitive, contracts the boundary into FOUR weight-class accumulators, then does
-    HRR ONCE per weight class:
-      weight 1  : value + all lowered sections (dnA/dnB/dnC)         → e0f0c_1
-      weight 2αA: upA section                                        → e0f0c_A
-      weight 2αB: upB section                                        → e0f0c_B
-      weight 2αC: upC section                                        → e0f0c_C
-    HRR is linear and geometry-only, so Σ_p w_p·HRR(bnd_p)=HRR(Σ_p w_p·bnd_p); the
-    per-primitive raise weight 2α_centre is therefore applied at the boundary
-    contraction, exactly matching the fused kernel's per-primitive weighting.
-    Same signature as recursum_gradctr. Returns (source, sections, nout, nnodes)."""
-    outputs_list, sections = grad_output_layout(la, lb, lc, ld)
-    out_index = {o: i for i, o in enumerate(outputs_list)}
-    nout = len(outputs_list)
-    dag = build_dag(outputs_list)
-    topo = dag.topological_order()
-    vrr_nodes, hrr_nodes, boundary_list, bidx = split_sets(dag, set(outputs_list))
-    nb = len(boundary_list); boundary = set(boundary_list)
-    name = class_name(la, lb, lc, ld) + suffix
-
-    # weight classes → the section names they own, and the raise-weight expression.
-    wclasses = [("1", "1.0", [k for k in sections if k == "val" or k.startswith("dn")]),
-                ("A", "wA", ["upA"] if "upA" in sections else []),
-                ("B", "wB", ["upB"] if "upB" in sections else []),
-                ("C", "wC", ["upC"] if "upC" in sections else [])]
-    wclasses = [wc for wc in wclasses if wc[2]]
-
-    # VRR tower liveness (boundary treated as outputs — no slot reuse).
-    topo_vrr = [n for n in topo if n in vrr_nodes]
-    vslot, vpeak = liveness_slots(topo_vrr, dag, boundary, reuse=True)
-
-    L = [f"// SPLIT augmented value+gradient kernel ({name}) [§8.3/§8.4 + §5.1 split]: "
-         f"{nout} outputs, {len(dag.nodes)} nodes, {nb} boundary, {len(wclasses)} weight-classes",
-         f"__attribute__((noinline)) void recursum_gradctr_{name}(",
-         "    const ScalarPack* __restrict__ sp,",
-         "    const double* __restrict__ kfa,",
-         "    const double* __restrict__ w2,   // cd x 3: 2*alpha for centres A,B,C",
-         "    int cd, int mstride,",
-         "    double* __restrict__ out,",
-         "    double* __restrict__ sc) {",
-         f"    for(int k=0;k<{nout};++k) out[k]=0.0;"]
-    for wid, _w, _s in wclasses:
-        L += [f"    double e0f0c_{wid}[{nb}];", f"    for(int k=0;k<{nb};++k) e0f0c_{wid}[k]=0.0;"]
-    L += ["    for(int c=0;c<cd;++c) {",
-          "        const ScalarPack& s = sp[c];",
-          "        const double* kf = kfa + (long)c*mstride;",
-          f"        double e0f0[{nb}];",
-          "        const double wA=w2[(long)c*3+0], wB=w2[(long)c*3+1], wC=w2[(long)c*3+2];"]
-    def vref(src):
-        if src in bidx:        return f"e0f0[{bidx[src]}]"
-        if not dag.nodes[src]: return f"kf[{src.m}]"
-        return f"sc[{vslot[src]}]"
-    for n in topo_vrr:
-        if not dag.nodes[n] and n not in boundary:
-            continue
-        rhs = node_rhs(n, dag, vref)
-        if n in bidx:    L.append(f"        e0f0[{bidx[n]}] = {rhs};")
-        elif n in vslot: L.append(f"        sc[{vslot[n]}] = {rhs};")
-    for wid, w, _s in wclasses:
-        if w == "1.0": L.append(f"        for(int k=0;k<{nb};++k) e0f0c_{wid}[k]+=e0f0[k];")
-        else:          L.append(f"        for(int k=0;k<{nb};++k) e0f0c_{wid}[k]+={w}*e0f0[k];")
-    L += ["    }", "    { const ScalarPack& s = sp[0]; (void)s;"]
-
-    # HRR once per weight class: reachable HRR nodes from that class's outputs.
-    hpeak_max = 0
-    for wid, _w, secnames in wclasses:
-        cls_outs = [o for k in secnames for o in
-                    outputs_list[sections[k][0]:sections[k][0]+sections[k][1]]]
-        # backward reachability through hrr_nodes (stop at boundary/vrr).
-        need = set(); stack = list(cls_outs)
-        while stack:
-            x = stack.pop()
-            if x in need or x not in hrr_nodes: continue
-            need.add(x)
-            for t in dag.nodes[x]: stack.append(t.source)
-        topo_h = [n for n in topo if n in need]
-        hslot, hpk = liveness_slots(topo_h, dag, set(cls_outs), reuse=True)
-        hpeak_max = max(hpeak_max, hpk)
-        oi_cls = {o: out_index[o] for o in cls_outs}
-        def href(src, wid=wid, hslot=hslot, oi_cls=oi_cls):
-            if src in bidx:      return f"e0f0c_{wid}[{bidx[src]}]"
-            if src in oi_cls:    return f"out[{oi_cls[src]}]"
-            if not dag.nodes[src]: return f"e0f0c_{wid}[{bidx[src]}]"
-            return f"sc[{hslot[src]}]"
-        # boundary-only outputs (no HRR): out = weighted contracted boundary directly.
-        for o in cls_outs:
-            if o in boundary and o not in need:
-                L.append(f"      out[{out_index[o]}] = e0f0c_{wid}[{bidx[o]}];")
-        for n in topo_h:
-            rhs = node_rhs(n, dag, href)
-            if n in oi_cls:  L.append(f"      out[{oi_cls[n]}] = {rhs};")
-            elif n in hslot: L.append(f"      sc[{hslot[n]}] = {rhs};")
-    L += ["    }", "}"]
-    return "\n".join(L), sections, nout, len(dag.nodes)
-
-
 # ---------------------------------------------------------------------------
 # Tier-1 FLAGSHIP: VRR/HRR contraction-boundary split (SHRIKE spec §5.1).
 # The class DAG is partitioned so the primitive-dependent VRR tower runs per
@@ -1271,16 +1162,9 @@ def generate_project(classes, outdir=".", naive_cap=20000):
         if emit_kernel(*cls)[2] > CHUNK_THRESHOLD:
             continue
         nm = class_name(*cls)
-        # Task #13: SPLIT augmented gradient kernel (VRR/primitive + HRR once/class)
-        # where the HRR stage is non-trivial; else the fused form. Same name+signature.
-        if grad_has_split(*cls):
-            gsrc, gsec, gnout, gnn = emit_gradctr_split_kernel(*cls)
-        else:
-            gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
+        gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
         _aug_outs = grad_output_layout(*cls)[0]
         _mmax = _bdag(_aug_outs).max_m()
-        # sc sizing = FULL augmented-DAG peak (safe upper bound; the split's
-        # max(vrr_peak, hrr_peak) is <= this, so the caller's scratch is sufficient).
         _slot, _gperk = liveness_slots(_bdag(_aug_outs).topological_order(),
                                        _bdag(_aug_outs), set(_aug_outs), reuse=True)
         with open(os.path.join(outdir, f"k_{nm}_gradctr.cpp"), "w") as f:
