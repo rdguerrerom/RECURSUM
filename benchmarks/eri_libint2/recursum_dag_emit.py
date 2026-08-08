@@ -532,6 +532,111 @@ def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
     L += ["    }", "}"]
     return "\n".join(L), sections, nout, len(dag.nodes)
 
+
+def emit_gradctr_kernel_chunked(la, lb, lc, ld, suffix="", interior_budget=1200,
+                                chunks_per_file=32):
+    """Chunked form of emit_gradctr_kernel for the ffff/fdff/ddff/fdfd/fpff-scale
+    classes whose augmented DAG is too large for one function (spec §8.3/§8.4).
+
+    Same outputs/sections/dispatch as the fused gradctr, but the augmented DAG is
+    partitioned (frontier-liveness at chunk granularity, _frontier_slots) into small
+    noinline chunk functions, and those chunk functions are SPLIT ACROSS SEVERAL
+    .cpp files (chunks_per_file each) so no single translation unit is huge (ffff's
+    280k-node augmented DAG would otherwise be one ~20 MB source). The chunk fns get
+    external linkage (recursum_<name>_gc<ci>) so the driver TU can call them. The
+    per-primitive OUTPUT array o[] is too big for the stack (ffff: 73k doubles), so
+    o[] and the frontier fr[] both live in caller scratch sc: o=sc[0:nout], fr=sc[nout:].
+    nscratch = nout + fr_peak. Returns (files, sections, nout, nnodes, nscratch),
+    where files = [(basename, source), ...] (last entry is the driver TU)."""
+    from eri_dag.chunker import partition
+    outputs_list, sections = grad_output_layout(la, lb, lc, ld)
+    outputs = set(outputs_list)
+    out_index = {o: i for i, o in enumerate(outputs_list)}
+    nout = len(outputs_list)
+    dag = build_dag(outputs_list)
+    topo = dag.topological_order()
+    chunks = partition(dag, topo, interior_budget=interior_budget,
+                       frontier_budget=10**9, import_budget=10**9,
+                       working_set_budget=10**9)
+    chunk_of = {}
+    for ci, ch in enumerate(chunks):
+        for n in ch.interior:
+            chunk_of[n] = ci
+    fr_slot, fr_peak = _frontier_slots(chunks, chunk_of, dag, topo)
+    name = class_name(la, lb, lc, ld) + suffix
+    pos = {n: i for i, n in enumerate(topo)}
+    up_w = {"upA": 0, "upB": 1, "upC": 2}
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cls) in sections.items())
+    fn_sig = (f"void recursum_{name}_gc%d(const ScalarPack& __restrict__ s, "
+              f"const double* __restrict__ kf, double* __restrict__ fr, double* __restrict__ o)")
+
+    def reffn(src, local):
+        if src in out_index:   return f"o[{out_index[src]}]"     # per-primitive output slot
+        if not dag.nodes[src]: return f"kf[{src.m}]"
+        if src in local:       return f"v{pos[src]}"
+        return f"fr[{fr_slot[src]}]"                              # boundary value from earlier chunk
+
+    def emit_one_chunk(ci, ch):
+        out = [f"__attribute__((noinline)) {fn_sig % ci} {{"]
+        local = set()
+        for n in ch.interior:
+            if not dag.nodes[n] and n not in outputs:
+                continue
+            rhs = node_rhs(n, dag, lambda src: reffn(src, local))
+            if n in outputs:
+                out.append(f"    o[{out_index[n]}] = {rhs};")
+            else:
+                out.append(f"    const double v{pos[n]} = {rhs};")
+                local.add(n)
+                if n in fr_slot:
+                    out.append(f"    fr[{fr_slot[n]}] = v{pos[n]};")
+        out.append("}")
+        return "\n".join(out)
+
+    files = []
+    nfiles = (len(chunks) + chunks_per_file - 1) // chunks_per_file
+    # chunk-function part files
+    for fi in range(nfiles):
+        lo, hi = fi*chunks_per_file, min((fi+1)*chunks_per_file, len(chunks))
+        P = [f"// gradctr chunk part {fi+1}/{nfiles} for ({name}) [§8.3/§8.4]: chunks {lo}..{hi-1}",
+             '#include "recursum_eri_scalars.h"']
+        for ci in range(lo, hi):
+            P.append(emit_one_chunk(ci, chunks[ci]))
+        files.append((f"k_{name}_gradctr_p{fi}.cpp", "\n".join(P)))
+
+    # driver TU: extern decls + per-primitive loop + weighted section accumulation.
+    D = [f"// CONTRACTED augmented value+gradient kernel ({name}) [chunked driver, §8.3/§8.4]: "
+         f"{nout} outputs, {len(dag.nodes)} nodes, {len(chunks)} chunks in {nfiles} files, frontier {fr_peak}",
+         f"//   sections: {hdr}   (o[] and fr[] both in caller scratch sc: o=sc[0:{nout}], fr=sc[{nout}:])",
+         '#include "recursum_eri_scalars.h"']
+    for ci in range(len(chunks)):
+        D.append(f"extern {fn_sig % ci};")
+    D += [f"__attribute__((noinline)) void recursum_gradctr_{name}(",
+          "    const ScalarPack* __restrict__ sp,",
+          "    const double* __restrict__ kfa,",
+          "    const double* __restrict__ w2,   // cd x 3: 2*alpha for centres A,B,C",
+          "    int cd, int mstride,",
+          "    double* __restrict__ out,",
+          "    double* __restrict__ sc) {   // caller scratch >= nout + frontier",
+          f"    double* __restrict__ o  = sc;",
+          f"    double* __restrict__ fr = sc + {nout};",
+          f"    for(int k=0;k<{nout};++k) out[k]=0.0;",
+          "    for(int c=0;c<cd;++c) {",
+          "        const ScalarPack& s = sp[c];",
+          "        const double* kf = kfa + (long)c*mstride;"]
+    for ci in range(len(chunks)):
+        D.append(f"        recursum_{name}_gc{ci}(s, kf, fr, o);")
+    D.append("        const double wA=w2[(long)c*3+0], wB=w2[(long)c*3+1], wC=w2[(long)c*3+2];")
+    for k, (st, cnt, _cls) in sections.items():
+        if k in up_w:
+            w = {"upA": "wA", "upB": "wB", "upC": "wC"}[k]
+            D.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+={w}*o[k];")
+        else:
+            D.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+=o[k];")
+    D += ["    }", "}"]
+    files.append((f"k_{name}_gradctr.cpp", "\n".join(D)))
+    return files, sections, nout, len(dag.nodes), nout + fr_peak
+
 # ---------------------------------------------------------------------------
 # Tier-1 FLAGSHIP: VRR/HRR contraction-boundary split (SHRIKE spec §5.1).
 # The class DAG is partitioned so the primitive-dependent VRR tower runs per
@@ -1159,17 +1264,26 @@ def generate_project(classes, outdir=".", naive_cap=20000):
     from eri_dag.dag import build_dag as _bdag
     gradctr_info = {}   # class name -> (nout, mmax, nscratch)
     for cls in classes:
-        if emit_kernel(*cls)[2] > CHUNK_THRESHOLD:
-            continue
         nm = class_name(*cls)
-        gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
         _aug_outs = grad_output_layout(*cls)[0]
         _mmax = _bdag(_aug_outs).max_m()
-        _slot, _gperk = liveness_slots(_bdag(_aug_outs).topological_order(),
-                                       _bdag(_aug_outs), set(_aug_outs), reuse=True)
-        with open(os.path.join(outdir, f"k_{nm}_gradctr.cpp"), "w") as f:
-            f.write(SCALAR_H + "\n" + gsrc + "\n")
-        tus.append(f"k_{nm}_gradctr.cpp")
+        if emit_kernel(*cls)[2] > CHUNK_THRESHOLD:
+            # ffff/fdff/ddff/fdfd/fpff-scale: chunked augmented kernel (o[] + fr[] in
+            # scratch), so f-shell FORCES use the fast gradctr path instead of the slow
+            # Engine(max_l+1) fallback. Chunk fns are split across several .cpp part
+            # files (no 20 MB single TU) and reported via `gfiles`.
+            gfiles, gsec, gnout, gnn, _gperk = emit_gradctr_kernel_chunked(*cls)
+            for fname, fsrc in gfiles:
+                with open(os.path.join(outdir, fname), "w") as f:
+                    f.write(fsrc + "\n")   # part files already #include scalars
+                tus.append(fname)
+        else:
+            gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
+            _slot, _gperk = liveness_slots(_bdag(_aug_outs).topological_order(),
+                                           _bdag(_aug_outs), set(_aug_outs), reuse=True)
+            with open(os.path.join(outdir, f"k_{nm}_gradctr.cpp"), "w") as f:
+                f.write(SCALAR_H + "\n" + gsrc + "\n")
+            tus.append(f"k_{nm}_gradctr.cpp")
         decls.append(f"void recursum_gradctr_{nm}(const ScalarPack*, const double*, "
                      f"const double*, int, int, double*, double*);")
         nscratch[f"gradctr_{nm}"] = max(_gperk, 1)
