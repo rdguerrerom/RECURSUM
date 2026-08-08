@@ -496,31 +496,38 @@ def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
     # section -> weight source: raised sections use w2[.][ci]; others weight 1.
     up_w = {"upA": 0, "upB": 1, "upC": 2}
     hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cls) in sections.items())
+    # o[] and DAG intermediates BOTH live in caller scratch sc (not the stack): the
+    # per-primitive output array o[] can be large (e.g. fdfd nout=26520), and a stack
+    # array that size risks overflow — o=sc[0:nout], intermediates=sc[nout:nout+peak].
+    # This keeps the FUSED (single-function) kernel viable up to ~150k-node classes,
+    # which the compiler optimises far better than the chunked form (no noinline
+    # barriers / frontier traffic) → much faster f-shell forces. nscratch = nout+peak.
     L = [f"// CONTRACTED augmented value+gradient kernel ({name}) [§8.3/§8.4]: "
          f"{nout} outputs, {len(dag.nodes)} DAG nodes",
          f"//   sections: {hdr}   (raised sections weighted by 2*alpha, w2[c*3+{{0:A,1:B,2:C}}])",
+         f"//   o=sc[0:{nout}], intermediates=sc[{nout}:{nout}+{peak}]",
          f"__attribute__((noinline)) void recursum_gradctr_{name}(",
          "    const ScalarPack* __restrict__ sp,",
          "    const double* __restrict__ kfa,",
          "    const double* __restrict__ w2,   // cd x 3: 2*alpha for centres A,B,C",
          "    int cd, int mstride,",
          "    double* __restrict__ out,",
-         "    double* __restrict__ sc) {",
+         "    double* __restrict__ sc) {   // caller scratch >= nout + peak-liveness",
+         f"    double* __restrict__ o = sc;",
          f"    for(int k=0;k<{nout};++k) out[k]=0.0;",
          "    for(int c=0;c<cd;++c) {",
          "        const ScalarPack& s = sp[c];",
-         "        const double* kf = kfa + (long)c*mstride;",
-         f"        double o[{nout}];"]
+         "        const double* kf = kfa + (long)c*mstride;"]
     def fref(src):
         if src in out_index:   return f"o[{out_index[src]}]"
         if not dag.nodes[src]: return f"kf[{src.m}]"
-        return f"sc[{slot[src]}]"
+        return f"sc[{nout}+{slot[src]}]"
     for n in topo:
         if not dag.nodes[n] and n not in out_index:
             continue
         rhs = node_rhs(n, dag, fref)
         if n in out_index:  L.append(f"        o[{out_index[n]}] = {rhs};")
-        elif n in slot:     L.append(f"        sc[{slot[n]}] = {rhs};")
+        elif n in slot:     L.append(f"        sc[{nout}+{slot[n]}] = {rhs};")
     # weighted accumulation per section
     L.append("        const double wA=w2[(long)c*3+0], wB=w2[(long)c*3+1], wC=w2[(long)c*3+2];")
     for k, (st, cnt, _cls) in sections.items():
@@ -530,11 +537,11 @@ def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
         else:
             L.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+=o[k];")
     L += ["    }", "}"]
-    return "\n".join(L), sections, nout, len(dag.nodes)
+    return "\n".join(L), sections, nout, len(dag.nodes), nout + peak
 
 
-def emit_gradctr_kernel_chunked(la, lb, lc, ld, suffix="", interior_budget=1200,
-                                chunks_per_file=32):
+def emit_gradctr_kernel_chunked(la, lb, lc, ld, suffix="", interior_budget=3000,
+                                chunks_per_file=14):
     """Chunked form of emit_gradctr_kernel for the ffff/fdff/ddff/fdfd/fpff-scale
     classes whose augmented DAG is too large for one function (spec §8.3/§8.4).
 
@@ -1267,20 +1274,21 @@ def generate_project(classes, outdir=".", naive_cap=20000):
         nm = class_name(*cls)
         _aug_outs = grad_output_layout(*cls)[0]
         _mmax = _bdag(_aug_outs).max_m()
+        # A fused single-function gradctr above ~CHUNK_THRESHOLD value-DAG nodes does not
+        # compile in reasonable time (a 90k-statement -O2 function is >5 min), so those
+        # classes are CHUNKED. The chunked emitter uses large chunks (interior_budget) to
+        # keep the per-quartet noinline/frontier overhead low while staying compilable,
+        # and splits chunk fns across several .cpp part files (no 20 MB single TU).
         if emit_kernel(*cls)[2] > CHUNK_THRESHOLD:
-            # ffff/fdff/ddff/fdfd/fpff-scale: chunked augmented kernel (o[] + fr[] in
-            # scratch), so f-shell FORCES use the fast gradctr path instead of the slow
-            # Engine(max_l+1) fallback. Chunk fns are split across several .cpp part
-            # files (no 20 MB single TU) and reported via `gfiles`.
             gfiles, gsec, gnout, gnn, _gperk = emit_gradctr_kernel_chunked(*cls)
             for fname, fsrc in gfiles:
                 with open(os.path.join(outdir, fname), "w") as f:
                     f.write(fsrc + "\n")   # part files already #include scalars
                 tus.append(fname)
         else:
-            gsrc, gsec, gnout, gnn = emit_gradctr_kernel(*cls)
-            _slot, _gperk = liveness_slots(_bdag(_aug_outs).topological_order(),
-                                           _bdag(_aug_outs), set(_aug_outs), reuse=True)
+            # Fused single-function gradctr (o[] + intermediates in scratch) for the
+            # small classes — the fastest runtime form.
+            gsrc, gsec, gnout, gnn, _gperk = emit_gradctr_kernel(*cls)
             with open(os.path.join(outdir, f"k_{nm}_gradctr.cpp"), "w") as f:
                 f.write(SCALAR_H + "\n" + gsrc + "\n")
             tus.append(f"k_{nm}_gradctr.cpp")
