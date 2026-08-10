@@ -199,6 +199,102 @@ struct OneEScalars {
 };
 """
 
+# ---------------------------------------------------------------------------
+# Augmented value+gradient one-electron kernels (spec §8.6). ONE kernel per
+# (la,lb) emits the value block AND the raised(+1)/lowered(-1) blocks on both the
+# bra (A) and ket (B) centres, sharing the single OS DAG -- the efficient path
+# (the value sub-DAG is CSE-shared with every shift output, mirroring the ERI
+# emit_grad_kernel §8.3; NOT the naive per-shift recompute). The C++ side forms
+# d/dA_i = 2a (a+1_i|b) - a_i (a-1_i|b) and d/dB_i analogously from the sections.
+def onee_grad_layout(la, lb):
+    """value ++ upA(la+1,lb) ++ dnA(la-1,lb) ++ upB(la,lb+1) ++ dnB(la,lb-1).
+    Returns (outputs_flat, sections{name:(start,count,(la,lb))})."""
+    outs, sec = [], {}
+    def add(name, a, b):
+        o = _outputs(a, b); sec[name] = (len(outs), len(o), (a, b)); outs.extend(o)
+    add("val", la, lb)
+    add("upA", la + 1, lb)
+    if la >= 1: add("dnA", la - 1, lb)
+    add("upB", la, lb + 1)
+    if lb >= 1: add("dnB", la, lb - 1)
+    return outs, sec
+
+
+def emit_onee_grad_sv(la, lb, op, fn_prefix, base_c, sig_base, comment):
+    """Augmented overlap/nuclear gradient kernel (one shared OS DAG)."""
+    outs, sec = onee_grad_layout(la, lb)
+    outset = set(outs); oidx = {o: i for i, o in enumerate(outs)}
+    dag = build_dag(outs, op=op); topo = dag.topological_order()
+    slot, peak = liveness_slots(topo, dag, outset)
+    name = _pair_name(la, lb)
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cl) in sec.items())
+    def ref(src):
+        if src in oidx: return f"out[{oidx[src]}]"
+        if not dag.nodes[src]: return base_c(src)
+        return f"sc[{slot[src]}]"
+    L = [f"// {comment} GRADIENT ({name}) [§8.6]: {len(outs)} outputs, {len(dag.nodes)} DAG nodes",
+         f"//   sections: {hdr}",
+         f"__attribute__((noinline)) void {fn_prefix}_grad_{name}(",
+         f"    const OneEScalars& __restrict__ s, {sig_base},",
+         "    double* __restrict__ out) {"]
+    if peak > 0: L.append(f"    double sc[{peak}];")
+    for n in topo:
+        if not dag.nodes[n] and n not in outset: continue
+        rhs = node_rhs(n, dag, ref, base_c)
+        if n in outset:   L.append(f"    out[{oidx[n]}] = {rhs};")
+        elif n in slot:   L.append(f"    sc[{slot[n]}] = {rhs};")
+    L.append("}")
+    return "\n".join(L), sec, len(outs), len(dag.nodes)
+
+
+def emit_onee_grad_kin(la, lb):
+    """Augmented kinetic gradient kernel: the kinetic combination applied to the
+    value AND shifted (a,b) output sets, over one shared overlap DAG."""
+    outs, sec = onee_grad_layout(la, lb)
+    outset = set(outs); oidx = {o: i for i, o in enumerate(outs)}
+    # overlap nodes every T output (value + shifts) consumes.
+    need = set()
+    for o in outs:
+        for kt in kinetic_terms(o.a, o.b): need.add(kt.source)
+    dag = build_dag(list(need), op="overlap"); topo = dag.topological_order()
+    snode = {n: i for i, n in enumerate(topo)}
+    name = _pair_name(la, lb)
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cl) in sec.items())
+    L = [f"// Kinetic T GRADIENT ({name}) [§8.6]: {len(outs)} outputs, {len(dag.nodes)} overlap DAG nodes",
+         f"//   sections: {hdr}",
+         f"__attribute__((noinline)) void recursum_kin_grad_{name}(",
+         "    const OneEScalars& __restrict__ s, double S00,",
+         "    double* __restrict__ out) {",
+         "    const double beta = s.beta;",
+         f"    double S[{len(topo)}];"]
+    def ref(src):
+        return "S00" if not dag.nodes[src] else f"S[{snode[src]}]"
+    for n in topo:
+        L.append(f"    S[{snode[n]}] = S00;" if not dag.nodes[n]
+                 else f"    S[{snode[n]}] = {node_rhs(n, dag, ref, lambda x:'S00')};")
+    for o in outs:
+        terms = []
+        for kt in kinetic_terms(o.a, o.b):
+            s_ref = "S00" if not dag.nodes[kt.source] else f"S[{snode[kt.source]}]"
+            if kt.kind == "beta_2b1": coef = f"beta * {2*kt.bi+1}.0"
+            elif kt.kind == "beta2":  coef = "2.0 * beta * beta"
+            else:                     coef = f"{0.5*kt.bi*(kt.bi-1)}"
+            sign = "-" if kt.sign < 0 else "+"
+            terms.append(f"{sign} ({coef}) * {s_ref}")
+        expr = " ".join(terms); expr = expr[2:] if expr.startswith("+ ") else expr
+        L.append(f"    out[{oidx[o]}] = {expr};")
+    L.append("}")
+    return "\n".join(L), sec, len(outs), len(dag.nodes)
+
+
+def emit_ovlp_grad(la, lb):
+    return emit_onee_grad_sv(la, lb, "overlap", "recursum_ovlp", lambda n: "S00",
+                             "double S00", "Overlap S")
+def emit_nuc_grad(la, lb):
+    return emit_onee_grad_sv(la, lb, "nuclear", "recursum_nuc", lambda n: f"kf[{n.m}]",
+                             "const double* __restrict__ kf", "Nuclear attraction V")
+
+
 # canonical (la >= lb) pairs up to f
 LADDER = [(0,0),(1,0),(1,1),(2,0),(2,1),(2,2),(3,0),(3,1),(3,2),(3,3)]
 
@@ -209,6 +305,7 @@ def generate_project(pairs=LADDER, outdir="."):
         f.write(SCALARS_H)
     parts = ['#include "recursum_onee_scalars.h"']
     decls = ["#pragma once", '#include "recursum_onee_scalars.h"']
+    grad_nout = {}   # (pref, la, lb) -> nout of the augmented grad kernel
     for la, lb in pairs:
         for emit, pref, sig in ((emit_overlap, "recursum_ovlp", "double"),
                                 (emit_nuclear, "recursum_nuc", "const double*"),
@@ -217,21 +314,37 @@ def generate_project(pairs=LADDER, outdir="."):
             parts.append(src)
             nm = f"{pref}_{_pair_name(la,lb)}"
             decls.append(f"void {nm}(const OneEScalars&, {sig}, double*);")
+        # augmented value+gradient kernels (§8.6): value + A±1/B±1 sections.
+        for gemit, pref, sig in ((emit_ovlp_grad, "recursum_ovlp", "double"),
+                                 (emit_nuc_grad,  "recursum_nuc",  "const double*"),
+                                 (emit_onee_grad_kin, "recursum_kin", "double")):
+            gsrc, gsec, gnout, _gnn = gemit(la, lb)
+            parts.append(gsrc)
+            gnm = f"{pref}_grad_{_pair_name(la,lb)}"
+            decls.append(f"void {gnm}(const OneEScalars&, {sig}, double*);")
+            grad_nout[(pref, la, lb)] = gnout
     with open(os.path.join(outdir, "onee_kernels.cpp"), "w") as f:
         f.write("\n\n".join(parts) + "\n")
     with open(os.path.join(outdir, "onee_decls.h"), "w") as f:
         f.write("\n".join(decls) + "\n")
     with open(os.path.join(outdir, "onee_dispatch.h"), "w") as f:
-        f.write(emit_dispatch(pairs))
+        f.write(emit_dispatch(pairs, grad_nout))
     return len(pairs)
 
 
-def emit_dispatch(pairs=LADDER) -> str:
+def emit_dispatch(pairs=LADDER, grad_nout=None) -> str:
     """(la,lb) -> kernel function pointer, for the contracted driver. Only
     canonical la>=lb classes exist; the driver swaps+transposes for la<lb."""
     def cases(pref):
         return "\n".join(f"    case {la*8+lb}: return {pref}_{_pair_name(la,lb)};"
                          for la, lb in pairs)
+    grad_nout = grad_nout or {}
+    def gcases(pref):
+        return "\n".join(f"    case {la*8+lb}: return {pref}_grad_{_pair_name(la,lb)};"
+                          for la, lb in pairs)
+    # nout is the same for all three ops (same layout); use overlap's.
+    noutcases = "\n".join(f"    case {la*8+lb}: return {grad_nout.get(('recursum_ovlp',la,lb),0)};"
+                           for la, lb in pairs)
     return f"""#pragma once
 // AUTO-GENERATED (la,lb) kernel dispatch. DO NOT EDIT.
 #include "recursum_onee_scalars.h"
@@ -257,6 +370,22 @@ static inline kin_fn onee_kin_dispatch(int la, int lb) {{
     default: return nullptr;
   }}
 }}
+// ---- Augmented value+gradient kernels (§8.6) ----
+typedef void (*ovlp_grad_fn)(const OneEScalars&, double, double*);
+typedef void (*nuc_grad_fn)(const OneEScalars&, const double*, double*);
+typedef void (*kin_grad_fn)(const OneEScalars&, double, double*);
+static inline ovlp_grad_fn onee_ovlp_grad_dispatch(int la,int lb){{ switch(la*8+lb){{
+{gcases("recursum_ovlp")}
+  default: return nullptr; }} }}
+static inline nuc_grad_fn onee_nuc_grad_dispatch(int la,int lb){{ switch(la*8+lb){{
+{gcases("recursum_nuc")}
+  default: return nullptr; }} }}
+static inline kin_grad_fn onee_kin_grad_dispatch(int la,int lb){{ switch(la*8+lb){{
+{gcases("recursum_kin")}
+  default: return nullptr; }} }}
+static inline int onee_grad_nout(int la,int lb){{ switch(la*8+lb){{
+{noutcases}
+  default: return 0; }} }}
 """
 
 

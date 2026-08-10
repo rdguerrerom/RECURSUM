@@ -116,6 +116,31 @@ def liveness_slots(topo: List[Integral], dag,
     return slot, next_slot
 
 
+def emit_cse_body(topo, nodes, outputs, *, rhs_of, stored, out_fmt, temp_fmt):
+    """Shared straight-line CSE-emission driver used by BOTH the ERI path
+    (emit_kernel, array + ssa styles) and the generic value-DAG front-end
+    (recursum_value_dag.emit_value_dag).
+
+    Walk `topo` (nodes in topological order) emitting each node EXACTLY ONCE:
+      * a leaf (empty `nodes[n]`) that is not an output is referenced inline by
+        the caller's ref function and never materialized here (skipped);
+      * an output node is emitted via `out_fmt(n, rhs)`;
+      * any other stored intermediate is emitted via `temp_fmt(n, rhs)`.
+    `rhs_of(n)` returns the C RHS string, `stored(n)` says whether the node gets
+    its own temporary. The CSE itself is structural: each unique node appears
+    once in `topo`, so a shared subexpression is emitted (and named) once."""
+    lines = []
+    for n in topo:
+        if not nodes[n] and n not in outputs:
+            continue
+        rhs = rhs_of(n)
+        if n in outputs:
+            lines.append(out_fmt(n, rhs))
+        elif stored(n):
+            lines.append(temp_fmt(n, rhs))
+    return lines
+
+
 def node_rhs(n: Integral, dag, reffn, kf="kf") -> str:
     """C expression for node n's value; reffn(src) names each source."""
     terms = dag.nodes[n]
@@ -266,21 +291,20 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
          "    const double* __restrict__ kf,   // kf[m] = K * F_m(T)",
          "    double* __restrict__ out) {"]
 
+    pos = {n: i for i, n in enumerate(topo)}
     if style == "ssa":
         # name every intermediate node by topo index; compiler handles liveness
-        vid = {}
+        vid = {n: f"v{pos[n]}" for n in topo if n in slot}
         def refssa(src):
             if src in out_index: return f"out[{out_index[src]}]"
             if not dag.nodes[src]: return f"kf[{src.m}]"
             return vid[src]
-        for i, n in enumerate(topo):
-            if not dag.nodes[n] and n not in outputs:
-                continue  # base -> referenced as kf[m] (unless it IS an output)
-            if n in outputs:
-                L.append(f"    out[{out_index[n]}] = {node_rhs(n, dag, refssa)};")
-            elif n in slot:
-                vid[n] = f"v{i}"
-                L.append(f"    const double v{i} = {node_rhs(n, dag, refssa)};")
+        L += emit_cse_body(
+            topo, dag.nodes, outputs,
+            rhs_of=lambda n: node_rhs(n, dag, refssa),
+            stored=lambda n: n in slot,
+            out_fmt=lambda n, r: f"    out[{out_index[n]}] = {r};",
+            temp_fmt=lambda n, r: f"    const double {vid[n]} = {r};")
         L.append("}")
         return "\n".join(L), len(outputs_list), len(dag.nodes), peak
 
@@ -291,14 +315,12 @@ def emit_kernel(la, lb, lc, ld, reuse=True, suffix="", style="array"):
         return f"sc[{slot[src]}]"
     if peak > 0:
         L.append(f"    double sc[{peak}];")
-    for n in topo:
-        if not dag.nodes[n] and n not in outputs:
-            continue  # base -> kf[m] (unless it IS an output, e.g. ssss)
-        rhs = node_rhs(n, dag, refarr)
-        if n in outputs:
-            L.append(f"    out[{out_index[n]}] = {rhs};")
-        elif n in slot:
-            L.append(f"    sc[{slot[n]}] = {rhs};")
+    L += emit_cse_body(
+        topo, dag.nodes, outputs,
+        rhs_of=lambda n: node_rhs(n, dag, refarr),
+        stored=lambda n: n in slot,
+        out_fmt=lambda n, r: f"    out[{out_index[n]}] = {r};",
+        temp_fmt=lambda n, r: f"    sc[{slot[n]}] = {r};")
     L.append("}")
     return "\n".join(L), len(outputs_list), len(dag.nodes), peak
 
