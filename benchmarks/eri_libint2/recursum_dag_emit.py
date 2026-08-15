@@ -339,6 +339,194 @@ CANON_LADDER = [
 CHUNK_THRESHOLD = 10000
 
 
+# ---------------------------------------------------------------------------
+# Augmented value+gradient ("gradctr") kernels — analytic nuclear gradients
+# (spec SHRIKE_SPEC.md §8.3/§8.4). RESTORED 2026-08-15: this codegen existed
+# and was validated (bit-exact vs central finite difference, 3.2e-11) in
+# commits fd52486->3b2cf49->8cd8438 on this repo's history, but was silently
+# dropped by c39d4c6 ("sync emitter to research HEAD"), which replaced this
+# file wholesale with a pre-gradctr version. This is a restoration/port, not
+# new derivative-recurrence math — see SHRIKE_Research/plan.md L76 for the
+# full audit trail. Only the FUSED, unchunked form is restored (the
+# VRR/HRR-split variant from f7d1165 was itself reverted upstream at
+# c20ae9e, and RECURSUM_GRADIENT_RECOMMENDATIONS.md §2 explicitly recommends
+# the fused form as correct/preferred); classes above CHUNK_THRESHOLD are
+# skipped here (chunked gradctr emission is deferred future work, tracked in
+# the same plan.md entry) rather than silently emitting a giant function.
+# ---------------------------------------------------------------------------
+
+def grad_output_layout(la, lb, lc, ld):
+    """AUGMENTED value+gradient output layout (spec §8.3). Returns
+    (outputs_flat, sections) where outputs_flat is the value block followed by the
+    raised (+1) and lowered (-1) blocks for the three explicit centres A,B,C
+    (the 4th centre D is recovered by translational invariance §8.2). sections
+    maps name -> (start, count, class) so the caller/digestion knows each block's
+    offset. Centres with l==0 have no lowered block. Building ONE DAG over the
+    whole list lets global CSE share the value sub-DAG across every derivative
+    output -- the codegen win a per-derivative kernel throws away."""
+    Ls = [la, lb, lc, ld]
+    outs = []
+    sections = {}
+    def add(name, cls):
+        o = output_set(*cls)
+        sections[name] = (len(outs), len(o), cls)
+        outs.extend(o)
+    add("val", (la, lb, lc, ld))
+    for ci, cn in enumerate(["A", "B", "C"]):
+        up = list(Ls); up[ci] += 1
+        add("up" + cn, tuple(up))
+        if Ls[ci] >= 1:
+            dn = list(Ls); dn[ci] -= 1
+            add("dn" + cn, tuple(dn))
+    return outs, sections
+
+
+def emit_gradctr_kernel(la, lb, lc, ld, suffix=""):
+    """Emit recursum_gradctr_<cls>: the CONTRACTED augmented value+gradient kernel
+    (spec §8.3 + §8.4). FUSED form: the in-kernel primitive loop computes the
+    augmented DAG outputs (value + shift sections) ONCE per primitive from the
+    shared straight-line body (VRR sub-DAG CSE preserved), then accumulates each
+    section with its contraction weight — the RAISED sections get an extra factor
+    `2*alpha_centre` (the exponent-dependent raise weight, §8.4), the value and
+    LOWERED sections get weight 1 (the contraction coeff is already in kf). The
+    2*alpha per differentiated centre per primitive is passed in `w2` (cd x 3:
+    A,B,C). deriv_X_c = up(a+1_c) - a_c*dn(a-1_c) is then formed by the C++ caller
+    from the sections. Verified bit-exact vs finite-difference of the contracted
+    value. Returns (source, sections, nout, nnodes, nscratch)."""
+    outputs_list, sections = grad_output_layout(la, lb, lc, ld)
+    outputs = set(outputs_list)
+    out_index = {o: i for i, o in enumerate(outputs_list)}
+    nout = len(outputs_list)
+    dag = build_dag(outputs_list)
+    topo = dag.topological_order()
+    slot, peak = liveness_slots(topo, dag, outputs, reuse=True)
+    name = class_name(la, lb, lc, ld) + suffix
+    # section -> weight source: raised sections use w2[.][ci]; others weight 1.
+    up_w = {"upA": 0, "upB": 1, "upC": 2}
+    hdr = ", ".join(f"{k}:out[{s}:{s+c}]" for k, (s, c, _cls) in sections.items())
+    # o[] and DAG intermediates BOTH live in caller scratch sc (not the stack): the
+    # per-primitive output array o[] can be large (e.g. fdfd nout=26520), and a stack
+    # array that size risks overflow — o=sc[0:nout], intermediates=sc[nout:nout+peak].
+    L = [f"// CONTRACTED augmented value+gradient kernel ({name}) [§8.3/§8.4]: "
+         f"{nout} outputs, {len(dag.nodes)} DAG nodes",
+         f"//   sections: {hdr}   (raised sections weighted by 2*alpha, w2[c*3+{{0:A,1:B,2:C}}])",
+         f"//   o=sc[0:{nout}], intermediates=sc[{nout}:{nout}+{peak}]",
+         f"__attribute__((noinline)) void recursum_gradctr_{name}(",
+         "    const ScalarPack* __restrict__ sp,",
+         "    const double* __restrict__ kfa,",
+         "    const double* __restrict__ w2,   // cd x 3: 2*alpha for centres A,B,C",
+         "    int cd, int mstride,",
+         "    double* __restrict__ out,",
+         "    double* __restrict__ sc) {   // caller scratch >= nout + peak-liveness",
+         f"    double* __restrict__ o = sc;",
+         f"    for(int k=0;k<{nout};++k) out[k]=0.0;",
+         "    for(int c=0;c<cd;++c) {",
+         "        const ScalarPack& s = sp[c];",
+         "        const double* kf = kfa + (long)c*mstride;"]
+    def fref(src):
+        if src in out_index:   return f"o[{out_index[src]}]"
+        if not dag.nodes[src]: return f"kf[{src.m}]"
+        return f"sc[{nout}+{slot[src]}]"
+    for n in topo:
+        if not dag.nodes[n] and n not in out_index:
+            continue
+        rhs = node_rhs(n, dag, fref)
+        if n in out_index:  L.append(f"        o[{out_index[n]}] = {rhs};")
+        elif n in slot:     L.append(f"        sc[{nout}+{slot[n]}] = {rhs};")
+    # weighted accumulation per section
+    L.append("        const double wA=w2[(long)c*3+0], wB=w2[(long)c*3+1], wC=w2[(long)c*3+2];")
+    for k, (st, cnt, _cls) in sections.items():
+        if k in up_w:
+            w = {"upA": "wA", "upB": "wB", "upC": "wC"}[k]
+            L.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+={w}*o[k];")
+        else:
+            L.append(f"        for(int k={st};k<{st+cnt};++k) out[k]+=o[k];")
+    L += ["    }", "}"]
+    return "\n".join(L), sections, nout, len(dag.nodes), nout + peak
+
+
+def emit_gradctr_dispatch_header(classes) -> str:
+    """Generate gradctr_dispatch.h: the exact 4 declarations
+    include/shrike/gradient_fast.hpp's `#ifndef RECURSUM_GRADCTR_T_DEFINED`
+    stub falls back to when this header is ABSENT — this header supplies the
+    real implementations and #defines that guard so the stub is bypassed.
+    Only classes actually gradctr-emitted (<=CHUNK_THRESHOLD nodes) appear in
+    the dispatch; others fall through to nullptr (caller uses gradient.hpp's
+    naive per-shift path, per gradient_fast.hpp's own documented fallback)."""
+    disp, mmax_disp, nscratch_disp = [], [], []
+    for cls in classes:
+        n_nodes = emit_kernel(*cls)[2]
+        if n_nodes > CHUNK_THRESHOLD:
+            continue  # chunked gradctr not yet restored — skip, fall back to nullptr
+        outputs_list, _sections = grad_output_layout(*cls)
+        dag = build_dag(outputs_list)
+        mmax = dag.max_m()
+        _src, _sections2, _nout, _nn, nscratch = emit_gradctr_kernel(*cls)
+        nm = class_name(*cls)
+        disp.append(f'    if(!strcmp(c,"{nm}")) return recursum_gradctr_{nm};')
+        mmax_disp.append(f'    if(!strcmp(c,"{nm}")) return {mmax};')
+        nscratch_disp.append(f'    if(!strcmp(c,"{nm}")) return {nscratch};')
+    return f"""#pragma once
+// AUTO-GENERATED gradctr (augmented value+gradient) dispatch. DO NOT EDIT.
+// Restores the RECURSUM_GRADCTR_T_DEFINED contract that
+// include/shrike/gradient_fast.hpp's stub block documents (see that file's
+// #ifndef RECURSUM_GRADCTR_T_DEFINED block for the authoritative interface).
+#include <cstring>
+#include "recursum_eri_scalars.h"
+#include "recursum_gradctr_decls.h"
+#define RECURSUM_GRADCTR_T_DEFINED 1
+typedef void (*recursum_gradctr_t)(const ScalarPack*, const double*, const double*,
+                                   int, int, double*, double*);
+static inline recursum_gradctr_t recursum_gradctr_dispatch(const char* c) {{
+{chr(10).join(disp)}
+    return nullptr;
+}}
+static inline int recursum_grad_mmax(const char* c) {{
+{chr(10).join(mmax_disp)}
+    return 0;
+}}
+static inline int recursum_grad_nscratch(const char* c) {{
+{chr(10).join(nscratch_disp)}
+    return 0;
+}}
+"""
+
+
+def generate_gradctr_project(classes, outdir="."):
+    """Emit gradctr kernel TUs (k_<cls>_gradctr.cpp, matching CMakeLists.txt's
+    existing `file(GLOB SHRIKE_GRADCTR_SRC "k_*_gradctr*.cpp")` — that glob has
+    been present, unfired, since it was written) + recursum_gradctr_decls.h +
+    gradctr_dispatch.h. Additive: does not touch generate_project's value-kernel
+    output, so the existing VALUE ladder (eri_classes.h, recursum_dispatch, etc.)
+    is completely unaffected by this call. Returns the list of generated .cpp
+    basenames (for the build to compile in parallel alongside the value TUs)."""
+    import os
+    tus = []
+    decls = ["#pragma once",
+             "// AUTO-GENERATED extern gradctr kernel declarations. DO NOT EDIT.",
+             '#include "recursum_eri_scalars.h"']
+    skipped = []
+    for cls in classes:
+        n_nodes = emit_kernel(*cls)[2]
+        if n_nodes > CHUNK_THRESHOLD:
+            skipped.append(class_name(*cls))
+            continue
+        src, _sections, _nout, _nn, _nscratch = emit_gradctr_kernel(*cls)
+        nm = class_name(*cls)
+        fn = f"k_{nm}_gradctr.cpp"
+        with open(os.path.join(outdir, fn), "w") as f:
+            f.write(SCALAR_H + "\n" + src + "\n")
+        tus.append(fn)
+        decls.append(
+            "void recursum_gradctr_" + nm +
+            "(const ScalarPack*, const double*, const double*, int, int, double*, double*);")
+    with open(os.path.join(outdir, "recursum_gradctr_decls.h"), "w") as f:
+        f.write("\n".join(decls) + "\n")
+    with open(os.path.join(outdir, "gradctr_dispatch.h"), "w") as f:
+        f.write(emit_gradctr_dispatch_header(classes))
+    return tus, skipped
+
+
 def emit_dispatch_header(classes) -> str:
     """Generate eri_classes.h: the Cls[] table + RECURSUM/naive/name dispatch,
     shared by bench_eri.cpp, perf_driver.cpp and validate_kernels.cpp so the
