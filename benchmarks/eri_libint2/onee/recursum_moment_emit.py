@@ -434,12 +434,29 @@ def generate_project(pairs, max_e: int = 2, prefix: str = "scdt",
 
     decl.append("")
     decl.append("/* Output counts per class, so a caller can size its buffers. */")
+    P = prefix.upper()
     for la, lb in pairs:
-        nm = pair_name(la, lb)
-        decl.append(f"#define {prefix.upper()}_MOMENT_NOUT_{nm.upper()} "
-                    f"{stats[nm]['value']['outputs']}")
-        decl.append(f"#define {prefix.upper()}_MOMENT_GRAD_NOUT_{nm.upper()} "
-                    f"{stats[nm]['grad']['outputs']}")
+        nm = pair_name(la, lb).upper()
+        decl.append(f"#define {P}_MOMENT_NOUT_{nm} "
+                    f"{stats[pair_name(la, lb)]['value']['outputs']}")
+        decl.append(f"#define {P}_MOMENT_GRAD_NOUT_{nm} "
+                    f"{stats[pair_name(la, lb)]['grad']['outputs']}")
+
+    decl.append("")
+    decl.append("/* Gradient section offsets and counts. A section is absent when the")
+    decl.append(" * shift would take an angular momentum below zero; its count is then 0")
+    decl.append(" * and the corresponding term drops out of the shift identity. */")
+    for la, lb in pairs:
+        nm = pair_name(la, lb).upper()
+        sec = stats[pair_name(la, lb)]["grad"]["sections"]
+        for tag in ("val", "upA", "dnA", "upB", "dnB"):
+            st, ct = (sec[tag][0], sec[tag][1]) if tag in sec else (0, 0)
+            decl.append(f"#define {P}_MGRAD_{nm}_{tag.upper()}_OFF {st}")
+            decl.append(f"#define {P}_MGRAD_{nm}_{tag.upper()}_CNT {ct}")
+
+    decl.append("")
+    decl.append("/* Moment components emitted, in order: overlap, dipole, quadrupole. */")
+    decl.append(f"#define {P}_MOMENT_NCOMP {len(moment_set(max_e))}")
     decl.append("")
     decl.append("#endif")
 
