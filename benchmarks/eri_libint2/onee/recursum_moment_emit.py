@@ -58,6 +58,41 @@ E_QUADRUPOLE: Tuple[Tuple[int, int, int], ...] = (
 E_OVERLAP: Tuple[Tuple[int, int, int], ...] = ((0, 0, 0),)
 
 
+# Cartesian component orderings. RECURSUM's own enumeration is lexicographic
+# descending; the "reference" ordering below is the one used by the GFN
+# parameterisations and by most integral libraries, where the pure powers come
+# first and the mixed ones follow:
+#
+#   RECURSUM  d: (200) (110) (101) (020) (011) (002)
+#   reference d: (200) (020) (002) (110) (101) (011)
+#
+# The two coincide for s and p, which is precisely why a mismatch survives
+# every cheap test and only shows up once d shells appear. Emitting directly in
+# the consumer's ordering is better than permuting at the call site: the
+# permutation would otherwise sit in the hot path and in every caller.
+_REFERENCE_CART = {
+    0: [(0, 0, 0)],
+    1: [(1, 0, 0), (0, 1, 0), (0, 0, 1)],
+    2: [(2, 0, 0), (0, 2, 0), (0, 0, 2), (1, 1, 0), (1, 0, 1), (0, 1, 1)],
+    3: [(3, 0, 0), (0, 3, 0), (0, 0, 3), (2, 1, 0), (2, 0, 1), (1, 2, 0),
+        (0, 2, 1), (1, 0, 2), (0, 1, 2), (1, 1, 1)],
+}
+
+
+def cart_order(l: int, convention: str = "reference"):
+    """Cartesian components of a shell, in the requested ordering."""
+    if convention == "recursum":
+        return list(all_ang_tuples(l))
+    if convention == "reference":
+        order = _REFERENCE_CART.get(l)
+        if order is None:
+            raise ValueError(f"no reference ordering for l={l}")
+        got, want = sorted(order), sorted(all_ang_tuples(l))
+        assert got == want, f"reference ordering for l={l} is not a permutation"
+        return order
+    raise ValueError(f"unknown convention {convention!r}")
+
+
 def moment_set(max_e: int) -> Tuple[Tuple[int, int, int], ...]:
     """All components with |e| <= max_e, overlap first then dipole then
     quadrupole. One kernel serves all three because they share a DAG."""
@@ -192,7 +227,8 @@ def _node_rhs(n, dag: FusedDAG, ref, base_expr: str, lang: str) -> str:
     return expr[2:] if expr.startswith("+ ") else expr
 
 
-def _outputs_for(la: int, lb: int, es) -> Tuple[List[MomE], Dict]:
+def _outputs_for(la: int, lb: int, es, convention: str = "reference"
+                 ) -> Tuple[List[MomE], Dict]:
     """Output nodes and their section layout: moment component major, then the
     Cartesian (a,b) block, so a consumer can take a contiguous block per
     component."""
@@ -200,8 +236,8 @@ def _outputs_for(la: int, lb: int, es) -> Tuple[List[MomE], Dict]:
     sections: Dict = {}
     for e in es:
         start = len(outs)
-        for a in all_ang_tuples(la):
-            for b in all_ang_tuples(lb):
+        for a in cart_order(la, convention):
+            for b in cart_order(lb, convention):
                 outs.append(MomE(a=a, b=b, e=e))
         sections[e] = (start, len(outs) - start)
     return outs, sections
@@ -255,7 +291,7 @@ def emit_value_kernel(la: int, lb: int, max_e: int, prefix: str = "scdt",
     return "\n".join(L), stats
 
 
-def grad_layout(la: int, lb: int, es):
+def grad_layout(la: int, lb: int, es, convention: str = "reference"):
     """value ++ upA ++ dnA ++ upB ++ dnB, each over all moment components.
 
     The shift identity is independent of the moment index, so the same five
@@ -266,8 +302,8 @@ def grad_layout(la: int, lb: int, es):
     def add(tag, a, b):
         start = len(outs)
         for e in es:
-            for aa in all_ang_tuples(a):
-                for bb in all_ang_tuples(b):
+            for aa in cart_order(a, convention):
+                for bb in cart_order(b, convention):
                     outs.append(MomE(a=aa, b=bb, e=e))
         sec[tag] = (start, len(outs) - start, (a, b))
 
